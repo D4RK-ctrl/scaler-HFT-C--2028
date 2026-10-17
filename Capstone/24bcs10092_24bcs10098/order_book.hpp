@@ -4,7 +4,7 @@
 
 namespace orderbook {
 
-// Common contract; OrderBookA is the Stage 2 concrete implementation.
+// Common interface for all implementations.
 // See implementations.md for the behavior of each operation.
 // An accepted ID may never be reused during this book instance's lifetime.
 class OrderBook {
