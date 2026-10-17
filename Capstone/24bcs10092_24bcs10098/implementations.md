@@ -1,7 +1,7 @@
-# Implementation architecture — Stage 3
+# Implementation architecture — Stage 4
 
-Implementations A and B are implemented independently. C remains proposed only.
-An initial deterministic A/B cross-check exists; no benchmark or profiling exists.
+A, B and C are implemented independently. Initial deterministic A/B and A/B/C
+cross-checks exist; no benchmark or profiling exists. A/B source is unchanged in Stage 4.
 
 ## Scope and common API
 
@@ -28,9 +28,9 @@ levels, bids descending and asks ascending. Depth counts distinct prices, not
 orders. Queries do not mutate the book. Old BBO/depth snapshots remain valid and
 unchanged after book mutations; modifying a snapshot cannot modify the book.
 
-## Shared A/B contract
+## Shared A/B/C contract
 
-| Case | Actual A/B behavior |
+| Case | Actual A/B/C behavior |
 | --- | --- |
 | Valid add | Store the full resting order; return `added`. |
 | Invalid enum side | Return `invalid_side`. |
@@ -112,7 +112,7 @@ does not add operations to the public API. Tests use runtime checks rather than
 assert, so Release `-DNDEBUG` does not disable them. They cover both sides, empty
 books, endpoints, invalid inputs, all cancellation positions, history, overflow,
 owned snapshots and dispatch through the abstract interface. The original 20 A cases are preserved as a shared templated suite and also run
-against B. C has no tests. These are not random differential tests.
+against B and C. These are not random differential tests.
 
 ## B. Indexed binary heaps — implemented
 
@@ -185,7 +185,7 @@ order fields, permanent history membership, heap/live counts and recomputed
 per-price totals against the aggregate hash tables. FIFO IDs are reconstructed
 by sequence, and explicit root-draining tests verify tie priority itself.
 
-There are 48 named cases in total: the original 20 A contract cases, the same
+Stage 3 introduced 48 cases: the original 20 A contract cases, the same
 20 applied to B, seven B-specific cases and one deterministic A/B cross-check.
 The B-specific cases cover root/downward repair, middle/upward repair,
 middle/downward repair, last-element removal, FIFO root order, 256-order
@@ -198,25 +198,97 @@ and both depth snapshots at depths -1, 0, 1, 3 and INT64_MAX after every operati
 It covers invalid input, overflow/retry, cancelled-ID rejection, repeated prices,
 unknown/repeated cancellation and complete draining. This is initial verification,
 not an independent reference model or a benchmark; shared bugs remain possible.
-## C. Tick arrays and occupancy bitmap — proposed only
+## C. Tick arrays and occupancy bitmap — implemented
 
-Each side has 5,000 fixed levels, FIFO order lists and totals. Tick offsets are
-`price - 5000` for bids and `price - 10001` for asks. An occupancy bitmap uses
-79 64-bit words per side, masking unused bits. BBO searches from the best end;
-depth visits set bits best-first. ID locators allow node unlinking; cancellation
-clears a bit when a level empties. A separate accepted-ID set retains history.
+`impl_c/orderbook_c.hpp` and `.cpp` define `OrderBookC`, independently of A/B.
+Each side has a `std::array<Level, 5000>`. Every level owns a cached signed 64-bit
+aggregate and a FIFO `std::list<Order>`. Each side also has a separate
+`std::array<uint64_t, 79>` bitmap. Empty level records remain allocated for the
+book lifetime; there is no tree, heap, or sorted-vector price index.
 
-This differs from tree and heap ordering. Costs include fixed empty-level storage,
-bitmap maintenance and ordinary list-node allocations. No pool or hierarchical
-bitmap is currently proposed. C++17 bit helpers must handle zero words safely.
+`live_` maps ID to side, fixed array index and list iterator. `used_ids_`
+permanently retains accepted IDs. Array locations and list nodes are stable;
+rehashing ID indexes does not invalidate stored node iterators. Copy and move
+are disabled. No caller timestamp or arrival sequence is needed: FIFO is list
+insertion order, with no sequence-exhaustion condition.
 
+### Tick and bitmap indexing
+
+After validating side and inclusive price boundaries, bid index is `price - 5000`
+and ask index is `price - 10001`. Both produce 0..4999. Word index is `index / 64`
+and bit position is `index % 64`; masks always use unsigned `uint64_t{1}`.
+Bits 0..7 of word 78 represent indexes 4992..4999. Its remaining 56 bits are
+invalid and always remain zero during normal operation. Query traversal also
+masks this word with 255 before selecting a bit, so an unused bit cannot address
+an invalid level. Other words have all 64 bits available.
+
+Bids scan words from 78 down to 0 and select the highest set bit. Asks scan from
+0 up to 78 and select the lowest set bit. `bit_index` uses portable shifts and
+masks at widths 32, 16, 8, 4, 2 and 1, without C++20 functions or compiler-specific
+intrinsics. It is called only with nonzero words; no shift reaches 64. Each
+selected index is converted back to a tick by adding its side's minimum price.
+
+### Five operations
+
+1. Add: validate all business inputs, find the direct level, check aggregate
+   overflow, append a FIFO node and insert history/live records. Only after all
+   allocations succeed, update the total and set the occupancy bit.
+2. Cancel: use the locator to subtract quantity, unlink the node and remove its
+   live record. Clear the bit when the list becomes empty; the fixed record
+   remains with total zero. Accepted-ID history is never removed.
+3. BBO: scan each bitmap for its best index and copy that level's cached total.
+   This allocates no snapshot and handles each empty side independently.
+4. Bid depth: scan high words/bits first, copy each occupied price/total, and stop
+   at the requested count. No individual-order scan or sorting is performed.
+5. Ask depth: scan low words/bits first with the same owned snapshot behavior.
+   Nonpositive depth returns immediately; oversized depth returns all levels.
+
+### Allocation failures and ID rules
+
+List-node allocation happens before either index mutation. If it fails, there
+is no state change. After a successful append, insertion of the permanent
+accepted-ID record and then the live locator may allocate. If either fails,
+completed history insertion is erased and the appended node is popped. Totals
+and bits are committed last using nonthrowing arithmetic/bit operations.
+`std::bad_alloc` propagates. Bucket capacities may remain enlarged, but logical
+book contents are intended to be restored. Allocation failure is not injected
+by the suite, so these rollback paths remain code-reviewed rather than
+fault-injection verified. Snapshot allocation failure does not mutate the book.
+
+Validation precedence, overflow checks, rejected-ID retry, permanent ID history,
+unknown cancellation and ID zero/UINT64_MAX follow A's shared contract exactly.
+There is no level-wide or book-wide scan for cancellation, and no allocation
+on successful cancellation.
+
+### C invariants and verification
+
+Test-only access checks all 10,000 fixed level records against bitmap occupancy,
+zero totals for empty levels, positive totals for occupied levels, FIFO-node sums,
+side/tick legality, each live locator, node/live-index counts, permanent history
+membership and unused final-word bits. Explicit FIFO expectations check list
+ordering. Production queries never perform this full validation scan.
+
+Stage 4 preserves the previous 48 cases and adds 20 C contract cases, nine
+C-specific cases and one A/B/C cross-check: 78 cases total. C-specific coverage:
+endpoints/first-last bits; 63/64, 127/128 and 4991/4992 boundaries; all eight final
+word bits plus defensive masking of deliberately poisoned unused bits; best-price
+changes and empty transitions; FIFO node cancellation and bit lifetime; overflow
+and ID rejection; sparse aggregated depth/snapshot stability; 256-order locator
+mutations; and bit-selection checks across every bit position.
+
+The A/B/C sequence compares operation results, BBO flags/prices/totals and both
+depth snapshots at -1, 0, 1, 3 and INT64_MAX after each operation, while checking
+all three internal invariant sets. It includes invalid requests, overflow/retry,
+ID reuse rejection, word-spanning prices, UINT64_MAX, repeated cancellation and
+complete draining. It is deterministic correctness verification, not a benchmark
+or a substitute for a future independent reference model.
 ## Expected complexity and limitations
 
 N = live orders; U = lifetime accepted IDs; L = occupied levels on the relevant
 side; K = min(positive depth, L); P = 5,000; W = ceil(P/64) = 79 per side.
 Hash costs below are expected amortized, not hard latency guarantees.
 
-| Operation | A: implemented | B: implemented | C: proposed |
+| Operation | A: implemented | B: implemented | C: implemented |
 | --- | --- | --- | --- |
 | Add | O(log(L+1)) | O(log(N+1)) | O(1) |
 | Cancel | O(1) amortized | O(log(N+1)) | O(1) |
@@ -238,8 +310,8 @@ are inferred from these bounds.
 
 ## Later authorized work and remaining decisions
 
-C implementation, broader differential verification, demo and benchmark are
-not part of Stage 3. Future verification should add an independent reference
+Broader differential verification, demo and benchmark are
+not part of Stage 4. Future verification should add an independent reference
 model, generated traces and allocation-failure injection.
 
 The benchmark must use exactly 1,000,000 primary operations: 700,000 adds,
@@ -249,6 +321,12 @@ per implementation, medians and actual Linux perf analysis. Seed, depth,
 warmup, timing boundaries and metrics still need review. Trace generation and
 correctness checks must remain outside timing, with query results consumed.
 
-Reviewer questions: approve B's implementation and aggregate/hash/sort
-tradeoff, any timestamp requirement, B's sequence-exhaustion policy, and final
+C has O(P) construction work and fixed storage even when empty; destruction
+also visits fixed level records in addition to freeing live nodes and ID records.
+Its FIFO nodes still allocate. Hash worst cases and history growth apply to C
+as well; bitmap discovery scans up to 79 words per side. This is not a pool or
+an allocation-free book. No performance advantage is claimed without measurement.
+
+Reviewer questions: approve C's implementation, any timestamp requirement,
+B's sequence-exhaustion policy, allocation-failure test scope, and final
 benchmark parameters. No benchmark results or screenshots exist at this stage.

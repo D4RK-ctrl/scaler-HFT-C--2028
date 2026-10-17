@@ -1,5 +1,6 @@
 #include "impl_a/orderbook_a.hpp"
 #include "impl_b/orderbook_b.hpp"
+#include "impl_c/orderbook_c.hpp"
 
 #include <algorithm>
 #include <map>
@@ -121,13 +122,65 @@ struct OrderBookBTestAccess {
         book.next_seq_ = std::numeric_limits<std::uint64_t>::max();
     }
 };
+struct OrderBookCTestAccess {
+    static bool valid(const OrderBookC& book) {
+        std::size_t count = 0;
+        for (Side side : {Side::bid, Side::ask}) {
+            const auto& levels = side == Side::bid ? book.bids_ : book.asks_;
+            const auto& bits = side == Side::bid ? book.bid_bits_ : book.ask_bits_;
+            // 5000 = 78*64 + 8: all remaining high bits must be zero.
+            if ((bits[78] & ~std::uint64_t{255}) != 0) return false;
+            for (std::size_t index = 0; index < 5000; ++index) {
+                const auto& level = levels[index];
+                const bool occupied = ((bits[index / 64] >> (index % 64)) & 1) != 0;
+                if (occupied != !level.orders.empty()) return false;
+                if (occupied ? level.total <= 0 : level.total != 0) return false;
+                Quantity sum = 0;
+                for (auto node = level.orders.begin(); node != level.orders.end(); ++node) {
+                    const auto& order = *node;
+                    const auto price = static_cast<PriceTicks>(index) + (side == Side::bid ? 5000 : 10001);
+                    if (order.side != side || order.price != price || order.quantity <= 0) return false;
+                    if (order.quantity > std::numeric_limits<Quantity>::max() - sum) return false;
+                    sum += order.quantity;
+                    const auto loc = book.live_.find(order.id);
+                    if (loc == book.live_.end() || loc->second.side != side ||
+                        loc->second.index != index || loc->second.order != node ||
+                        book.used_ids_.count(order.id) != 1) return false;
+                    ++count;
+                }
+                if (sum != level.total) return false;
+            }
+        }
+        return count == book.live_.size() && book.used_ids_.size() >= count;
+    }
+    static std::vector<OrderId> fifo(const OrderBookC& book, Side side, PriceTicks price) {
+        const auto& levels = side == Side::bid ? book.bids_ : book.asks_;
+        const auto index = static_cast<std::size_t>(price - (side == Side::bid ? 5000 : 10001));
+        std::vector<OrderId> ids;
+        for (const auto& order : levels.at(index).orders) ids.push_back(order.id);
+        return ids;
+    }
+    static std::size_t used_count(const OrderBookC& book) { return book.used_ids_.size(); }
+    static std::uint64_t word(const OrderBookC& book, Side side, std::size_t w) {
+        return (side == Side::bid ? book.bid_bits_ : book.ask_bits_).at(w);
+    }
+    static void set_unused_bits(OrderBookC& book, bool set) {
+        book.bid_bits_[78] = set ? ~std::uint64_t{255} : 0;
+        book.ask_bits_[78] = set ? ~std::uint64_t{255} : 0;
+    }
+    static unsigned bit(std::uint64_t word, bool highest) {
+        return OrderBookC::bit_index(word, highest);
+    }
+};
 } // namespace orderbook
 
 namespace {
 using namespace orderbook;
 template <typename Book>
 using Access = std::conditional_t<std::is_same_v<Book, OrderBookA>,
-                                  OrderBookATestAccess, OrderBookBTestAccess>;
+                                  OrderBookATestAccess,
+                                  std::conditional_t<std::is_same_v<Book, OrderBookB>,
+                                                     OrderBookBTestAccess, OrderBookCTestAccess>>;
 
 constexpr Quantity max_qty = std::numeric_limits<Quantity>::max();
 constexpr Depth all_depth = std::numeric_limits<Depth>::max();
@@ -513,11 +566,192 @@ int run_heap_tests() {
     return passed == tests.size() ? 0 : 1;
 }
 
+int run_bitmap_tests() {
+    const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"tick endpoints map to first and last valid bits", [] {
+            OrderBookC c;
+            add(c, 1, Side::bid, 5000, 2); add(c, 2, Side::bid, 9999, 3);
+            add(c, 3, Side::ask, 10001, 5); add(c, 4, Side::ask, 15000, 7);
+            for (Side side : {Side::bid, Side::ask}) {
+                require(OrderBookCTestAccess::word(c, side, 0) == 1, "first bit not set");
+                require(OrderBookCTestAccess::word(c, side, 78) == 128, "last bit not set");
+            }
+            levels(c.get_bids(10), {{9999, 3}, {5000, 2}});
+            levels(c.get_asks(10), {{10001, 5}, {15000, 7}});
+            add(c, 5, Side::bid, 4999, 1, AddResult::invalid_price);
+            add(c, 5, Side::bid, 10000, 1, AddResult::invalid_price);
+            add(c, 5, Side::ask, 10000, 1, AddResult::invalid_price);
+            add(c, 5, Side::ask, 15001, 1, AddResult::invalid_price);
+        }},
+        {"word boundaries 63-64 127-128 and 4991-4992", [] {
+            OrderBookC c; OrderId id = 1;
+            for (Side side : {Side::bid, Side::ask}) {
+                for (int index : {63, 64, 127, 128, 4991, 4992})
+                    add(c, id++, side, (side == Side::bid ? 5000 : 10001) + index, 1);
+                require(OrderBookCTestAccess::word(c, side, 0) == (std::uint64_t{1} << 63), "word0");
+                require(OrderBookCTestAccess::word(c, side, 1) == ((std::uint64_t{1} << 63) | 1), "word1");
+                require(OrderBookCTestAccess::word(c, side, 2) == 1, "word2");
+                require(OrderBookCTestAccess::word(c, side, 77) == (std::uint64_t{1} << 63), "word77");
+                require(OrderBookCTestAccess::word(c, side, 78) == 1, "word78");
+            }
+            levels(c.get_bids(10), {{9992, 1}, {9991, 1}, {5128, 1}, {5127, 1}, {5064, 1}, {5063, 1}});
+            levels(c.get_asks(10), {{10064, 1}, {10065, 1}, {10128, 1}, {10129, 1}, {14992, 1}, {14993, 1}});
+        }},
+        {"final partial word has exactly eight valid bits", [] {
+            OrderBookC c; OrderId id = 1;
+            for (Side side : {Side::bid, Side::ask}) {
+                for (int index = 4992; index < 5000; ++index)
+                    add(c, id++, side, (side == Side::bid ? 5000 : 10001) + index, 1);
+                require(OrderBookCTestAccess::word(c, side, 78) == 255, "invalid final word mask");
+            }
+            quote(c.get_bbo().bid, 9999, 1); quote(c.get_bbo().ask, 14993, 1);
+            for (OrderId key = 1; key <= 16; ++key) cancel(c, key);
+            require(OrderBookCTestAccess::word(c, Side::bid, 78) == 0 &&
+                    OrderBookCTestAccess::word(c, Side::ask, 78) == 0, "final word not cleared");
+            // Deliberately corrupt only unused bits to exercise defensive query masking.
+            OrderBookCTestAccess::set_unused_bits(c, true);
+            require(!OrderBookCTestAccess::valid(c), "invariants missed unused bits");
+            require(!c.get_bbo().bid && !c.get_bbo().ask, "query used an invalid array index");
+            levels(c.get_bids(10), {}); levels(c.get_asks(10), {});
+            OrderBookCTestAccess::set_unused_bits(c, false);
+            require(OrderBookCTestAccess::valid(c), "failed to restore bitmap");
+        }},
+        {"best changes across words and complete empty transition", [] {
+            OrderBookC c;
+            add(c, 1, Side::bid, 5000, 2); add(c, 2, Side::bid, 5064, 3);
+            add(c, 3, Side::bid, 9999, 4); add(c, 4, Side::ask, 10001, 5);
+            add(c, 5, Side::ask, 10129, 6); add(c, 6, Side::ask, 15000, 7);
+            cancel(c, 3); quote(c.get_bbo().bid, 5064, 3);
+            cancel(c, 2); quote(c.get_bbo().bid, 5000, 2);
+            cancel(c, 4); quote(c.get_bbo().ask, 10129, 6);
+            cancel(c, 5); quote(c.get_bbo().ask, 15000, 7);
+            cancel(c, 1); require(!c.get_bbo().bid, "bid did not empty");
+            cancel(c, 6); require(!c.get_bbo().ask, "ask did not empty");
+            add(c, 7, Side::ask, 10001, 8); quote(c.get_bbo().ask, 10001, 8);
+        }},
+        {"FIFO cancellation keeps bit until final node", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookC c; const PriceTicks price = side == Side::bid ? 5064 : 10065;
+                add(c, 90, side, price, 2); add(c, 10, side, price, 3); add(c, 70, side, price, 5);
+                cancel(c, 10); fifo(c, side, price, {90, 70});
+                require(OrderBookCTestAccess::word(c, side, 1) == 1, "bit cleared prematurely");
+                cancel(c, 90); fifo(c, side, price, {70});
+                cancel(c, 70); require(OrderBookCTestAccess::word(c, side, 1) == 0, "bit remained");
+                add(c, 5, side, price, 11); fifo(c, side, price, {5});
+                add(c, 10, side, price, 1, AddResult::duplicate_id);
+            }
+        }},
+        {"overflow and used IDs leave bitmap unchanged", [] {
+            OrderBookC c;
+            add(c, 0, Side::bid, 9999, max_qty);
+            add(c, 1, Side::bid, 9999, 1, AddResult::quantity_overflow);
+            require(OrderBookCTestAccess::word(c, Side::bid, 78) == 128, "overflow changed bits");
+            cancel(c, 999, CancelResult::not_found); cancel(c, 0);
+            add(c, 0, Side::ask, 10001, 1, AddResult::duplicate_id);
+            add(c, 1, Side::bid, 9999, 2); quote(c.get_bbo().bid, 9999, 2);
+            cancel(c, 0, CancelResult::not_found);
+        }},
+        {"sparse cross-word aggregated depth and owned snapshots", [] {
+            OrderBookC c;
+            add(c, 1, Side::bid, 5000, 2); add(c, 2, Side::bid, 7000, 3);
+            add(c, 3, Side::bid, 9999, 5); add(c, 4, Side::bid, 7000, 7);
+            add(c, 5, Side::ask, 10001, 11); add(c, 6, Side::ask, 13000, 13);
+            add(c, 7, Side::ask, 15000, 17);
+            const auto bids = c.get_bids(all_depth); const auto asks = c.get_asks(all_depth);
+            levels(bids, {{9999, 5}, {7000, 10}, {5000, 2}});
+            levels(asks, {{10001, 11}, {13000, 13}, {15000, 17}});
+            levels(c.get_bids(2), {{9999, 5}, {7000, 10}});
+            levels(c.get_asks(2), {{10001, 11}, {13000, 13}});
+            cancel(c, 3); cancel(c, 5);
+            levels(bids, {{9999, 5}, {7000, 10}, {5000, 2}});
+            levels(asks, {{10001, 11}, {13000, 13}, {15000, 17}});
+        }},
+        {"locator consistency through index growth and arbitrary removals", [] {
+            OrderBookC c;
+            for (OrderId id = 1; id <= 256; ++id) {
+                const Side side = id % 2 == 0 ? Side::bid : Side::ask;
+                const auto index = static_cast<PriceTicks>((id * 37) % 5000);
+                add(c, id, side, (side == Side::bid ? 5000 : 10001) + index, 1);
+            }
+            for (OrderId i = 0; i < 256; ++i) cancel(c, (i * 73) % 256 + 1);
+            require(!c.get_bbo().bid && !c.get_bbo().ask, "locator test did not drain book");
+            require(OrderBookCTestAccess::used_count(c) == 256, "accepted history lost");
+        }},
+        {"portable bit selection for every nonzero bit position", [] {
+            for (unsigned bit = 0; bit < 64; ++bit) {
+                const auto word = std::uint64_t{1} << bit;
+                require(OrderBookCTestAccess::bit(word, true) == bit, "highest single bit wrong");
+                require(OrderBookCTestAccess::bit(word, false) == bit, "lowest single bit wrong");
+                require(OrderBookCTestAccess::bit(word | 1, true) == bit, "highest mixed bit wrong");
+                require(OrderBookCTestAccess::bit(word | 1, false) == 0, "lowest mixed bit wrong");
+            }
+        }},
+        {"deterministic A-B-C cross-verification after each operation", [] {
+            OrderBookA a; OrderBookB b; OrderBookC c;
+            auto compare = [&] {
+                const auto x = a.get_bbo();
+                for (OrderBook* book : {static_cast<OrderBook*>(&b), static_cast<OrderBook*>(&c)}) {
+                    const auto y = book->get_bbo();
+                    require(x.bid.has_value() == y.bid.has_value() &&
+                            x.ask.has_value() == y.ask.has_value(), "ABC BBO flags differ");
+                    if (x.bid) quote(y.bid, x.bid->price, x.bid->total_quantity);
+                    if (x.ask) quote(y.ask, x.ask->price, x.ask->total_quantity);
+                    for (Depth d : {Depth{-1}, Depth{0}, Depth{1}, Depth{3}, all_depth}) {
+                        levels(book->get_bids(d), a.get_bids(d));
+                        levels(book->get_asks(d), a.get_asks(d));
+                    }
+                }
+                require(OrderBookATestAccess::valid(a) && OrderBookBTestAccess::valid(b) &&
+                        OrderBookCTestAccess::valid(c), "ABC internal invariants differ");
+            };
+            auto insert = [&](Order order) {
+                const auto result = a.add_order(order);
+                require(b.add_order(order) == result && c.add_order(order) == result, "ABC add differs");
+                compare();
+            };
+            auto erase = [&](OrderId id) {
+                const auto result = a.cancel_order(id);
+                require(b.cancel_order(id) == result && c.cancel_order(id) == result, "ABC cancel differs");
+                compare();
+            };
+            compare(); insert({0, Side::bid, 9999, max_qty});
+            insert({1, Side::bid, 9999, 1}); erase(0); insert({1, Side::bid, 9999, 1});
+            insert({0, Side::ask, 15000, 1});
+            const auto max_id = std::numeric_limits<OrderId>::max();
+            insert({max_id, Side::ask, 10001, 7});
+            insert({2, Side::ask, 15001, 1}); insert({2, Side::ask, 10001, 0});
+            insert({2, static_cast<Side>(5), 10001, 1}); erase(999);
+            for (OrderId id = 10; id < 138; ++id) {
+                const Side side = id % 2 == 0 ? Side::bid : Side::ask;
+                const auto index = static_cast<PriceTicks>((id * 127) % 5000);
+                insert({id, side, (side == Side::bid ? 5000 : 10001) + index,
+                        static_cast<Quantity>(id % 11 + 1)});
+                if (id % 5 == 0) erase(id - 1);
+            }
+            for (OrderId id = 10; id < 138; ++id) { erase(id); erase(id); }
+            erase(1); erase(max_id);
+            require(!c.get_bbo().bid && !c.get_bbo().ask, "ABC book did not empty");
+        }}
+    };
+    std::size_t passed = 0;
+    for (const auto& test : tests) {
+        try { test.second(); ++passed; std::cout << "C-specific PASS: " << test.first << '\n'; }
+        catch (const std::exception& e) {
+            std::cout << "C-specific FAIL: " << test.first << ": " << e.what() << '\n';
+        }
+    }
+    std::cout << "C-specific/ABC cross-check: " << passed << " PASS, " << tests.size() - passed
+              << " FAIL, " << tests.size() << " tests.\n";
+    return passed == tests.size() ? 0 : 1;
+}
+
 int main() {
     const int a = run_contract<orderbook::OrderBookA>("A contract");
     const int b = run_contract<orderbook::OrderBookB>("B contract");
+    const int c = run_contract<orderbook::OrderBookC>("C contract");
     const int heaps = run_heap_tests();
-    std::cout << "Total: 48 cases (20 A, 20 B contract, 7 B-specific, 1 A/B cross-check). "
-                 "C not implemented/tested.\n";
-    return a || b || heaps;
+    const int bitmap = run_bitmap_tests();
+    std::cout << "Total: 78 cases (20 A, 20 B contract, 20 C contract, 7 B-specific, "
+                 "9 C-specific, 1 A/B cross-check, 1 A/B/C cross-check).\n";
+    return a || b || c || heaps || bitmap;
 }
