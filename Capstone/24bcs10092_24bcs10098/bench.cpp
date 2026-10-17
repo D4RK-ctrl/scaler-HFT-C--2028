@@ -27,7 +27,7 @@ using Clock = std::chrono::steady_clock;
 enum class Kind { add, cancel, bbo };
 struct Op { Kind kind; Order order; };
 struct Counts { std::uint64_t adds, cancels, bbos, depth; };
-struct Config { char impl = 0; std::uint64_t ops = 1000000, runs = 5, seed = 42; };
+struct Config { bool profile_only = false; char impl = 0; std::uint64_t ops = 1000000, runs = 5, seed = 42; };
 constexpr std::uint64_t hash_start = 14695981039346656037ULL;
 void mix(std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 1099511628211ULL; }
 void consume(std::uint64_t& hash, const Bbo& bbo) {
@@ -41,11 +41,13 @@ void consume(std::uint64_t& hash, const DepthSnapshot& levels) {
     for (const auto& level : levels) { mix(hash, static_cast<std::uint64_t>(level.price)); mix(hash, level.total_quantity); }
 }
 void usage(std::ostream& out) {
-    out << "bench --impl A|B|C [--ops N] [--runs N] [--seed N]\n"
+    out << "bench --impl A|B|C [--ops N] [--runs N] [--seed N] [--profile-only]\n"
            "Defaults: ops=1000000 runs=5 seed=42. Limits: ops=10..2000000, runs=1..25.\n"
            "Counts: adds=floor(7*N/10), cancels=floor(2*N/10), BBO=remainder.\n"
            "Both depth(10) calls occur after every 100 primary operations.\n"
-           "All A/B/C outcomes are validated untimed before selected implementation's runs.\n";
+           "Standard mode validates A/B/C untimed before selected implementation runs.\n"
+           "Profile-only: selected implementation only; requires ops=1000000 seed=42 runs=1\n"
+           "(runs defaults to 1 in this mode); checks the approved Stage 6 fixture.\n";
 }
 std::uint64_t number(std::string_view text) {
     std::uint64_t value = 0;
@@ -59,6 +61,10 @@ Config parse(int argc, char** argv) {
     std::unordered_set<std::string> seen;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--profile-only") {
+            if (!seen.insert(arg).second) throw std::invalid_argument("duplicate option: " + arg);
+            config.profile_only = true; continue;
+        }
         if (arg != "--impl" && arg != "--ops" && arg != "--runs" && arg != "--seed")
             throw std::invalid_argument("unknown option: " + arg);
         if (!seen.insert(arg).second) throw std::invalid_argument("duplicate option: " + arg);
@@ -75,6 +81,11 @@ Config parse(int argc, char** argv) {
     if (!config.impl) throw std::invalid_argument("--impl is required");
     if (config.ops < 10 || config.ops > 2000000) throw std::invalid_argument("--ops must be 10..2000000");
     if (config.runs < 1 || config.runs > 25) throw std::invalid_argument("--runs must be 1..25");
+    if (config.profile_only) {
+        if (seen.count("--runs") == 0) config.runs = 1;
+        if (config.ops != 1000000 || config.seed != 42 || config.runs != 1)
+            throw std::invalid_argument("profile-only supports only the approved ops=1000000 seed=42 runs=1 fixture");
+    }
     return config;
 }
 Counts counts(std::uint64_t n) { return {n * 7 / 10, n * 2 / 10, n - n * 7 / 10 - n * 2 / 10, n / 100}; }
@@ -287,7 +298,7 @@ int main(int argc, char** argv) {
 #ifdef __linux__
         utsname os{};
         if (uname(&os) == 0) std::cout << "os=" << os.sysname << ' ' << os.release << ' ' << os.machine << '\n';
-        std::cout << "RSS scope: process lifetime high-water KiB, includes trace and untimed validation; "
+        std::cout << "RSS scope: process lifetime high-water KiB, includes trace and setup/validation; "
                      "faults: per-replay deltas, construction/destruction excluded.\n";
 #else
         std::cout << "OS resource counters unavailable; printed resource fields are zero.\n";
@@ -296,7 +307,22 @@ int main(int argc, char** argv) {
                   << 1e9 * Clock::period::num / Clock::period::den << '\n';
         const auto trace = generate(config); // Once per invocation, outside all replay timers.
         const auto count = counts(config.ops);
-        validate_trace(trace, count);
+        const auto fingerprint = validate_trace(trace, count);
+        if (config.profile_only) {
+            // This is a specific approved Stage 6 fixture, never an oracle for arbitrary input.
+            if (fingerprint != 1002121172284863879ULL)
+                throw std::runtime_error("profile trace differs from approved Stage 6 fixture");
+            std::cout << "PROFILE_ONLY selected implementation; whole-process perf includes setup, replay, final checks and destruction.\n";
+            auto book = make_book(config.impl);
+            const auto result = replay(*book, trace, true);
+            if (result.checksum != 12750139682901687748ULL ||
+                !same_quote(result.final_bbo.bid, PriceLevel{9999, 2988}) ||
+                !same_quote(result.final_bbo.ask, PriceLevel{10001, 2344}))
+                throw std::runtime_error("profile result differs from approved Stage 6 fixture");
+            report("profile_run=1", result, count);
+            std::cout << "PROFILE_FIXTURE_VALIDATION=PASS\n";
+            return 0;
+        }
         Result expected;
         for (char impl : {'A', 'B', 'C'}) {
             auto book = make_book(impl);

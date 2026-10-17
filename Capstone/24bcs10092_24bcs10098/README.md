@@ -5,7 +5,7 @@
 | Daksh Shah | 24bcs10092 | shah.24bcs10092@sst.scaler.com |
 | Tirth Bhalani | 24bcs10098 | tirth.24bcs10098@sst.scaler.com |
 
-Stage 6: approved A/B/C and verification are preserved; the deterministic benchmark is added for review.
+Stage 7: approved algorithms/verification/benchmark are preserved; isolated profiling mode and real perf evidence are added for review.
 C++17, Release `-O2`, single instrument and single thread. No matching or trades.
 A/B/C have deterministic/random correctness verification and preliminary benchmark results.
 
@@ -194,3 +194,34 @@ These are preliminary WSL measurements with per-call instrumentation and warm
 allocator/cache effects. See [benchmark.md](benchmark.md) for all five runs,
 per-operation/depth medians, environment, raw output and fairness limitations.
 No perf profiling or screenshots have been collected in Stage 6.
+## Selected-implementation perf profiling (Stage 7)
+
+Use --profile-only for perf. Standard mode runs A/B/C validation in the same
+process, so wrapping it directly would include other implementations. The
+profiling-only mode skips those passes, executes one selected replay, and checks
+the approved Stage 6 fingerprint/checksum/final BBO fixture. It intentionally
+accepts only --ops 1000000 --seed 42 --runs 1; runs defaults to 1 in this mode.
+It is not a fixture oracle for arbitrary seeds. Standard mode remains unchanged.
+
+```sh
+# From the repository root in Ubuntu WSL:
+cmake -S Capstone/24bcs10092_24bcs10098 -B Capstone/24bcs10092_24bcs10098/build-profile -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer"
+cmake --build Capstone/24bcs10092_24bcs10098/build-profile
+cd Capstone/24bcs10092_24bcs10098
+./build-profile/bench --impl A --ops 1000000 --runs 1 --seed 42 --profile-only
+sh scripts/profile.sh
+```
+
+The script collects five-repeat requested perf counters, five-repeat grouped
+numerator/denominator pairs, and one cycles:u call-graph record for each of A/B/C.
+It uses local symbols (DEBUGINFOD_URLS empty) after remote symbol lookup stalled.
+No kernel settings are changed. Debug/frame-pointer compilation retains C++17
+and -O2. Perf covers setup, the selected replay, final checks and destruction;
+this is not a replay-only enabled window. It includes no other book replay.
+
+See [profiling.md](profiling.md) for exact commands, actual counter means/rates,
+profiles, environment and limitations. Small raw text evidence is in profiling/;
+binary perf.data and full local reports remain ignored under build-profile/.
+All requested events were available with 100% running time, and all three call
+graphs were collected successfully. Stage 6 measurements in benchmark.md remain
+intact. No screenshots have been generated.
