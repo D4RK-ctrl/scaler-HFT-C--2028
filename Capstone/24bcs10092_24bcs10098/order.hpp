@@ -39,7 +39,7 @@ struct Bbo {
 
 using DepthSnapshot = std::vector<PriceLevel>;
 
-// Shared operation results; implemented by A in Stage 2.
+// Results returned by order book operations.
 // duplicate_id includes any ID accepted earlier in this book's lifetime,
 // even after cancellation. Rejected adds do not consume IDs.
 enum class AddResult {
