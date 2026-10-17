@@ -5,123 +5,107 @@
 | Daksh Shah | 24bcs10092 | shah.24bcs10092@sst.scaler.com |
 | Tirth Bhalani | 24bcs10098 | tirth.24bcs10098@sst.scaler.com |
 
-Stage 7: approved algorithms/verification/benchmark are preserved; isolated profiling mode and real perf evidence are added for review.
-C++17, Release `-O2`, single instrument and single thread. No matching or trades.
-A/B/C have deterministic/random correctness verification and preliminary benchmark results.
+A C++17, single-instrument, single-threaded resting order book implemented three
+ways. There is no matching or trade generation. No external order-book libraries
+are required. Code, tests, demo, measured reports and six inspected, user-captured
+PNG screenshots are available for review. Screenshot coverage is partial; the
+team has selected these six images for the final submission.
 
-## Layout
+## Contract and architecture
 
-| Path | Current purpose |
+The five operations are `add_order`, `cancel_order`, `get_bbo`, `get_bids`, and
+`get_asks`. Prices use integer ticks (100.01 = 10001): bids 5000..9999 and asks
+10001..15000 inclusive. IDs are uint64_t; quantities and aggregates are positive
+int64_t. BBO sides are independent optionals. Depth owns its aggregated price
+levels, bids descending and asks ascending. Nonpositive depth returns empty.
+
+Accepted IDs cannot be reused, even after cancellation. Rejected adds consume
+no ID; ID zero is valid. Invalid side/price/quantity, duplicate IDs and aggregate
+overflow return explicit results without logical mutation. Unknown cancellation
+returns not_found. FIFO follows successful insertion order.
+
+| Implementation | Primary price ordering | Cancellation and depth |
+| --- | --- | --- |
+| [A](impl_a/orderbook_a.hpp) | std::map levels with FIFO lists | ID locators unlink orders; ordered level traversal |
+| [B](impl_b/orderbook_b.hpp) | Indexed vector-backed binary heaps of orders | ID positions repair swaps; aggregate hash levels copied/sorted for depth |
+| [C](impl_c/orderbook_c.hpp) | Fixed 5000-level arrays and 79-word bitmaps per side | ID/list locators; best-first occupied-bit traversal |
+
+All three own independent storage and permanent accepted-ID history. See
+[implementations.md](implementations.md) for exact behavior, invariants,
+complexities, allocation rollback and limitations.
+
+## Directory guide
+
+| Path | Purpose |
 | --- | --- |
-| order.hpp | Integer tick/quantity types, orders, aggregated levels, optional BBO sides and result enums |
-| order_book.hpp | Abstract interface for the five required operations |
-| impl_a/ | Working map/FIFO OrderBookA (.hpp and .cpp) |
-| impl_b/ | Indexed binary-heap OrderBookB (.hpp and .cpp) |
-| impl_c/ | Fixed tick-array/occupancy-bitmap OrderBookC (.hpp and .cpp) |
-| main.cpp | Comment-only placeholder for a later demo; not built |
-| verify.cpp | Original 78 deterministic cases plus seeded independent-reference random verification |
-| bench.cpp | Exact-count deterministic trace, untimed A/B/C checks and instrumented replay |
-| implementations.md | Proposed API contract, invariants, designs, complexity and review questions |
-| benchmark.md | Measurement method, full preliminary 1M/five-run output, medians and limitations |
-| screenshots/ | Only .gitkeep; no screenshots yet |
+| [order.hpp](order.hpp), [order_book.hpp](order_book.hpp) | Shared types and five-operation interface |
+| [impl_a/](impl_a/), [impl_b/](impl_b/), [impl_c/](impl_c/) | Independent implementations |
+| [main.cpp](main.cpp) | Genuine deterministic demo |
+| [verify.cpp](verify.cpp) | 78 deterministic cases and seeded reference-model verification |
+| [bench.cpp](bench.cpp) | Exact-count benchmark and isolated profiling mode |
+| [analysis.md](analysis.md) | Concise final interpretation and workload-specific recommendation |
+| [benchmark.md](benchmark.md) | Original five-run measurements, commands, raw output and limitations |
+| [profiling.md](profiling.md), [profiling/](profiling/) | Actual perf counters, ratios and call-graph evidence |
+| [scripts/profile.sh](scripts/profile.sh) | Reproducible perf collection |
+| [screenshots/README.md](screenshots/README.md) | Six selected screenshots and partial-coverage disclosure |
 
-Shared headers and entry points are at the project root to keep navigation simple.
-CMake builds orderbook_a, orderbook_b and orderbook_c static libraries, verify and bench.
-The demo placeholder main.cpp is not built.
+## Build in Ubuntu WSL
 
-## Build and verify A/B/C in Ubuntu WSL
-
-From the repository root:
+Requires GCC or Clang with C++17, CMake 3.16+, and Make or another CMake generator.
+From the repository root in Ubuntu:
 
 ```sh
-cmake -S Capstone/24bcs10092_24bcs10098 -B Capstone/24bcs10092_24bcs10098/build -DCMAKE_BUILD_TYPE=Release
-cmake --build Capstone/24bcs10092_24bcs10098/build --verbose
-ctest --test-dir Capstone/24bcs10092_24bcs10098/build --output-on-failure
-./Capstone/24bcs10092_24bcs10098/build/verify
+cd Capstone/24bcs10092_24bcs10098
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --verbose
 ```
 
-Requires GCC or Clang, CMake 3.16+, and Make (or another CMake generator).
-The verify executable runs 78 named cases. CTest registers one executable,
-implementations_abc. Release uses `-O2 -DNDEBUG -std=c++17`; runtime checks
-remain active under NDEBUG.
-Generated build directories are ignored within this submission.
+This builds libraries orderbook_a/b/c and executables demo, verify and bench.
+Release explicitly uses **-std=c++17 -O2 -DNDEBUG**; language extensions are off.
+Generated build directories, objects, executables and local profiling binaries
+are ignored. No committed build cache or binary is needed.
 
-## Public semantics and independent designs
-
-The interface takes integer ticks (`100.01 = 10001`), uint64_t order IDs and
-integer quantities. Bids are 5000..9999 ticks; asks are 10001..15000 ticks.
-Depth returns aggregated price levels, bids descending and asks ascending.
-BBO includes aggregate quantities; optional sides provide explicit presence
-flags through `has_value()`. IDs cannot be reused, even after cancellation;
-A, B and C retain accepted-ID history for the book lifetime. Rejected adds do not consume
-IDs, ID zero is valid, and invalid inputs or quantity overflow leave state unchanged.
-Depth <= 0 returns an empty snapshot; unknown cancellations return not_found. See
-[implementations.md](implementations.md) for the complete contract.
-
-- A (implemented): ordered std::map price levels, FIFO order lists and live-ID locators.
-- B (implemented): indexed binary heaps of orders, ID positions and price aggregate hash tables;
-  depth copies and sorts occupied levels. Additional synchronization and sorting
-  costs are explicit design concerns.
-- C (implemented): fixed tick arrays, occupancy bitmap, FIFO order lists and live-ID locators.
-
-A/B/C use no external libraries and own independent storage and mutation logic.
-The shared types and interface do not select a default implementation yet.
-
-## Reference organization
-
-[PR #159](https://github.com/KnightKnight27/scaler-HFT-C--2028/pull/159) was
-inspected at head `20cbbca2fe0694c63482f5794f3cf2912fd95b2a`: changed paths,
-README and CMake only. Its root shared headers/entry points, implementation
-subdirectories and report locations informed this layout. Its CMake has separate
-implementation libraries and demo/verify/bench executables; A/B/C libraries, verify and bench targets exist here. We retain C++17 and our map/indexed-heap/tick-array designs.
-No source implementation, reports, measurements or screenshots were copied.
-The mandatory benchmark uses 1,000,000 primary operations; see benchmark.md.
-
-B completes allocations before heap movements and rolls back provisional entries on
-failure. Allocation-failure injection remains future work. Arrival-sequence exhaustion
-throws before mutation. See implementations.md for the strategy and limitations.
-
-C uses 5,000 fixed levels and 79 bitmap words per side. Its last word has eight
-valid bits; queries mask unused bits. Cached totals and FIFO-node locators avoid
-order scans for depth/cancellation. Its list/index allocations finish before
-committing totals and occupancy; allocation-failure injection remains future work.
-
-## Seeded randomized correctness verification
-
-Run from the project directory in Ubuntu WSL after the Release build:
+## Run the demo
 
 ```sh
+./build/demo
+```
+
+Each implementation shows an empty book, five additions including same-price
+aggregation, cancellation within a level, removal of the best bid/ask levels,
+and rejection of a cancelled ID. All five APIs are exercised. Final quotes are
+bid 98.50 x 7 and ask 102.00 x 8. Exit 0 and `DEMO CONSISTENCY PASS` require all
+three to match the same explicit expected states; no trades are produced.
+
+## Correctness verification
+
+```sh
+ctest --test-dir build --output-on-failure
 ./build/verify
 ./build/verify --random --ops 100000 --seed 42
 ./build/verify --random --ops 100000 --seed 7
 ./build/verify --random --ops 100000 --seed 2026
 ```
 
-Every invocation runs the existing 78 deterministic cases first. `--random`
-defaults to 100000 operations and seed 42; `--help` shows usage. Numeric options
-are unsigned decimal integers. `--ops` and `--seed` require `--random`.
+CTest registers one executable containing 78 named cases: 20 contracts per
+implementation, seven B heap/sequence cases, nine C bitmap cases and two cross-
+checks. Runtime checks remain active under NDEBUG. Random invocations first run
+those cases, then use mt19937_64 with configurable seed (default 42) and operation
+count (default 100000). Cancels choose live IDs only; IDs never repeat.
 
-The generator uses mt19937_64 and explicit rejection sampling: approximately
-70% adds, 20% cancellations from live IDs only, and 10% BBO operations. An empty
-cancellation choice becomes an add. Add side is sampled 50/50, quantities are
-1..100 and tick prices are uniform across each side's 5000 valid ticks. IDs are
-monotonic and never reused. The printed exact counts need not equal the nominal
-percentages. Additional BBO/depth comparisons are verification work outside
-those primary operation counts.
+The independent oracle uses append-only records and sorted aggregate vectors.
+It compares operation results, BBO and both top-ten depths after every operation;
+full depth, internal invariants and an independently rebuilt oracle are checked
+every 1000 operations and at final partial checkpoints. Failures print seed,
+operation, implementation and expected/observed values, and exit nonzero.
 
-The independent model uses append-only order records and sorted aggregate
-vectors, with no production map, heap, bitmap or locator code. Every operation
-compares results, BBO and both top-ten snapshots. Full-depth comparisons and
-internal invariant checks run initially, every 1000 operations and at the final
-partial checkpoint. The model also rebuilds aggregates from live records then.
+Previously observed Release runs of 100000 operations for seeds 42, 7 and 2026
+passed. ASan/UBSan also passed 100000 seed-42 operations in the verification stage.
+Final readiness checks passed all 78 cases and a fresh 10000-operation seed-42
+sample: 6989 adds, 1990 cancels, 1021 BBO, 11 full/invariant checkpoints.
+Finite seeds and these results do not prove exhaustive correctness.
 
-Failures report seed, one-based operation index (0 for initial state), operation
-details, implementation, check, expected and observed values; exit is nonzero.
-Progress is printed every 10000 operations. Runtime is correctness-verification
-wall time, not order-book benchmark latency or throughput. Logs under build/
-are ignored. No benchmark or perf measurements are performed.
-
-Sanitizer commands, also from the project directory:
+Optional sanitizer build, from this project directory:
 
 ```sh
 g++ -std=c++17 -O2 -g -fsanitize=address,undefined \
@@ -131,97 +115,83 @@ g++ -std=c++17 -O2 -g -fsanitize=address,undefined \
 ./build/verify_sanitized --random --ops 100000 --seed 42
 ```
 
-### Observed Stage 5 Release results
-
-All original 78 deterministic cases passed. The following reference-model runs
-also passed with zero mismatches; each completed 101 full-depth/invariant checks.
-
-| Seed | Primary ops | Adds | Live-ID cancels | BBO ops | Bid adds | Ask adds | Final live | Verification seconds |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 42 | 100000 | 70017 | 19906 | 10077 | 35098 | 34919 | 50111 | 126.965 |
-| 7 | 100000 | 69882 | 20155 | 9963 | 34910 | 34972 | 49727 | 152.467 |
-| 2026 | 100000 | 69966 | 20164 | 9870 | 35047 | 34919 | 49802 | 153.103 |
-
-Durations include verification overhead and concurrent test-run load. They are
-not benchmark measurements and should not be used to compare implementations.
-Five malformed CLI cases were rejected: negative count, uint64 overflow, seed
-without --random, missing count, and unknown flag. A zero-operation run passed
-with default seed 42 and one initial full/invariant checkpoint.
-
-Repeatability check: two seed-42 runs of 1234 operations produced identical output
-excluding elapsed time (842 adds, 277 cancels, 115 BBO operations, three checkpoints).
-ASan/UBSan also passed all 78 deterministic cases and 100000 random operations
-with seed 42, exit 0, with no sanitizer diagnostics. Counts matched Release:
-70017 adds, 19906 cancels, 10077 BBO operations and 101 full/invariant checkpoints.
-Observed sanitizer verification wall time: 309.457 seconds; this is checking
-runtime, not a benchmark. Logs are retained only in ignored build artifacts.
-## Deterministic benchmark (Stage 6)
-
-From the project directory in Ubuntu WSL, after the Release build:
+## Mandatory benchmark
 
 ```sh
 ./build/bench --help
-./build/bench --impl A --ops 1000 --runs 2 --seed 42
 ./build/bench --impl A --ops 1000000 --runs 5 --seed 42
 ./build/bench --impl B --ops 1000000 --runs 5 --seed 42
 ./build/bench --impl C --ops 1000000 --runs 5 --seed 42
 ```
 
-Run mandatory commands sequentially. Each generates one deterministic trace,
-audits it and validates A/B/C outcomes outside timing, then runs the selected
-implementation with five fresh empty books. The 1M trace contains exactly 700000
-adds, 200000 live-ID cancels and 100000 BBO calls, plus both depth(10) calls every
-100 operations (10000 calls per side). The same seed produces the same trace
-fingerprint across commands. IDs are never reused and prices are integer ticks.
+Run sequentially. Each invocation generates one trace, audits it and validates
+A/B/C outcomes outside timing, then replays the same trace five times on newly
+constructed empty books. Counts are exactly 700000 adds, 200000 live cancels,
+100000 BBO, plus 10000 calls per depth side. Seed-42 fingerprint is
+1002121172284863879; checksum 12750139682901687748; final BBO is bid 9999:2988,
+ask 10001:2344 (ticks:quantity).
 
-Custom --ops N uses floor(7*N/10) adds, floor(2*N/10) cancels and the remaining
-operations as BBO; both depth calls occur floor(N/100) times. Supported bounds:
-ops=10..2000000, runs=1..25, seed=0..UINT64_MAX. --impl A/B/C is required.
-Defaults are ops=1000000, runs=5, seed=42. Invalid CLI values fail with usage.
+CLI bounds: ops=10..2000000, runs=1..25, seed=0..UINT64_MAX; --impl is required.
+Custom counts use floor(7*N/10) adds, floor(2*N/10) cancels, BBO=remainder and
+floor(N/100) queries per depth side. Defaults are 1000000/5/42.
 
-Overall replay time includes all required depth calls, timer overhead and checksum
-bookkeeping. Per-operation means use timed sections and actual counts; reported
-medians are medians of per-run means, not isolated latencies. Construction,
-destruction, trace generation, validation and printing are outside replay timing.
-Real Linux page-fault deltas and process high-water RSS are reported; RSS includes
-trace and untimed A/B/C passes, so it does not isolate selected-book memory.
+Original five-run overall medians: **A 429.377 ms, B 6737.518 ms, C 327.892 ms**.
+Depth and instrumentation are included. These are preliminary WSL measurements,
+not pure operation latencies. RSS includes trace and untimed validation, not
+selected-book-only memory. [benchmark.md](benchmark.md) retains the exact original
+results; later smoke checks do not replace those five-run measurements.
 
-Observed mandatory medians (Release -O2, seed 42): A 429.377 ms, B 6737.518 ms,
-C 327.892 ms. Every timed and validation replay agreed on checksum
-12750139682901687748 and final BBO bid 9999:2988, ask 10001:2344 (ticks:quantity).
-B's median depth total was 6063.265 ms: the required sorting cost is fully retained.
-These are preliminary WSL measurements with per-call instrumentation and warm
-allocator/cache effects. See [benchmark.md](benchmark.md) for all five runs,
-per-operation/depth medians, environment, raw output and fairness limitations.
-No perf profiling or screenshots have been collected in Stage 6.
-## Selected-implementation perf profiling (Stage 7)
+## Linux perf profiling
 
-Use --profile-only for perf. Standard mode runs A/B/C validation in the same
-process, so wrapping it directly would include other implementations. The
-profiling-only mode skips those passes, executes one selected replay, and checks
-the approved Stage 6 fingerprint/checksum/final BBO fixture. It intentionally
-accepts only --ops 1000000 --seed 42 --runs 1; runs defaults to 1 in this mode.
-It is not a fixture oracle for arbitrary seeds. Standard mode remains unchanged.
+Use --profile-only when wrapping bench with perf: standard mode executes other
+implementations' validation passes. Profile-only executes only the selected
+implementation and validates the approved fixture; it intentionally supports
+only ops=1000000, seed=42, runs=1 (default in this mode).
+
+From the project directory:
 
 ```sh
-# From the repository root in Ubuntu WSL:
-cmake -S Capstone/24bcs10092_24bcs10098 -B Capstone/24bcs10092_24bcs10098/build-profile -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer"
-cmake --build Capstone/24bcs10092_24bcs10098/build-profile
-cd Capstone/24bcs10092_24bcs10098
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer"
+cmake --build build-profile
 ./build-profile/bench --impl A --ops 1000000 --runs 1 --seed 42 --profile-only
 sh scripts/profile.sh
 ```
 
-The script collects five-repeat requested perf counters, five-repeat grouped
-numerator/denominator pairs, and one cycles:u call-graph record for each of A/B/C.
-It uses local symbols (DEBUGINFOD_URLS empty) after remote symbol lookup stalled.
-No kernel settings are changed. Debug/frame-pointer compilation retains C++17
-and -O2. Perf covers setup, the selected replay, final checks and destruction;
-this is not a replay-only enabled window. It includes no other book replay.
+The script collects five-repeat counters and grouped rate denominators, then
+cycles:u call graphs for each implementation. It clears DEBUGINFOD_URLS only
+locally because remote symbol lookup stalled. Kernel security settings remain
+unchanged. All requested events were available at 100% running time, and the
+recorded profiles reported zero lost samples. Perf includes setup, the selected
+replay, validation and destruction, not just the chrono replay window.
 
-See [profiling.md](profiling.md) for exact commands, actual counter means/rates,
-profiles, environment and limitations. Small raw text evidence is in profiling/;
-binary perf.data and full local reports remain ignored under build-profile/.
-All requested events were available with 100% running time, and all three call
-graphs were collected successfully. Stage 6 measurements in benchmark.md remain
-intact. No screenshots have been generated.
+[profiling.md](profiling.md) preserves exact commands, counter means, denominators,
+hotspots and WSL limitations. Raw small text evidence is tracked under profiling/;
+perf.data and full local reports are ignored under build-profile/.
+
+## Screenshots and submission readiness
+
+Six user-captured screenshots were visually inspected for readability and relevance:
+
+- [Deterministic verification](screenshots/verification.png): the final verification output and 78-case count.
+- [A/B/C demo](screenshots/demo.png): all expected states and final consistency PASS.
+- Archived perf counters: [A](screenshots/perf-stat-A.png), [B](screenshots/perf-stat-B.png), [C](screenshots/perf-stat-C.png).
+- [B hotspots](screenshots/perf-report-B.png): introsort 43.66% and depth 43.57% self overhead.
+
+The perf images show terminal views of previously collected evidence files,
+not new measurements. Long report symbols are clipped, but the relevant names
+and percentages remain readable. See the [inventory](screenshots/README.md).
+**Screenshot coverage is partial.** The team has chosen to submit these six
+existing images. Release-build, mandatory benchmark A/B/C and perf-report A/C
+output is not covered by screenshots; build/test instructions and measured text
+evidence remain available in the documentation. No further captures are planned.
+
+[analysis.md](analysis.md) recommends C for this bounded-price workload while
+explaining B's measured sorting bottleneck, memory/history costs and measurement
+limits. Allocation-failure injection, exhaustive traces, isolated cold-start/tail-
+latency measurements and controlled native Linux benchmarking remain unperformed.
+The code is an educational submission, not a production-readiness certification.
+
+The directory organization was informed by the changed paths, README and CMake
+of [PR #159](https://github.com/KnightKnight27/scaler-HFT-C--2028/pull/159) at head
+20cbbca2fe0694c63482f5794f3cf2912fd95b2a. No implementation source, report prose,
+measurements or screenshots were copied from that reference.

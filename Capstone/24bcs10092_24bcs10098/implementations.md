@@ -1,9 +1,9 @@
-# Implementation architecture — Stage 6
+# Implementation architecture
 
-A, B and C are implemented independently. Deterministic cross-checks and a seeded
-independent reference-model verifier exist. Stage 6 adds the deterministic benchmark;
-see benchmark.md for boundaries, preliminary measurements and limitations. No profiling
-exists yet. All three approved implementation sources remain unchanged in Stage 6.
+Three independent implementations share one contract. The demo exercises all five
+APIs; verification, benchmark and selected-only perf tooling are implemented.
+See [analysis.md](analysis.md), [benchmark.md](benchmark.md) and
+[profiling.md](profiling.md) for observed results and measurement scope.
 
 ## Scope and common API
 
@@ -42,7 +42,7 @@ unchanged after book mutations; modifying a snapshot cannot modify the book.
 | Aggregate would exceed `INT64_MAX` | Return `quantity_overflow`. |
 | Unknown/already-cancelled cancellation | Return `not_found`; no mutation. |
 | Known cancellation | Remove the entire order; return `cancelled`. |
-| Last order removed at a price | Erase that price level. |
+| Last order removed at a price | Remove the occupied level; C retains its zeroed fixed record with the bit clear. |
 | Empty BBO side | `nullopt`, independently of the other side. |
 | Empty side or depth <= 0 | Empty depth vector. |
 | Depth above available levels | All occupied levels, best-first. |
@@ -61,8 +61,8 @@ API. Separate new book instances have independent ID histories.
 
 A stores FIFO order through list insertion order, so no timestamp or arrival
 counter is needed. Orders are never sorted by ID. A has no sequence-exhaustion
-condition. Whether future public input must contain timestamps remains a reviewer
-question; current FIFO follows successful call order.
+condition. The current public contract has no caller timestamp; FIFO follows successful
+call order.
 
 ## Actual A storage and five operations
 
@@ -187,7 +187,7 @@ order fields, permanent history membership, heap/live counts and recomputed
 per-price totals against the aggregate hash tables. FIFO IDs are reconstructed
 by sequence, and explicit root-draining tests verify tie priority itself.
 
-Stage 3 introduced 48 cases: the original 20 A contract cases, the same
+B verification includes the original shared contract and heap-specific cases: the original 20 A contract cases, the same
 20 applied to B, seven B-specific cases and one deterministic A/B cross-check.
 The B-specific cases cover root/downward repair, middle/upward repair,
 middle/downward repair, last-element removal, FIFO root order, 256-order
@@ -270,8 +270,8 @@ side/tick legality, each live locator, node/live-index counts, permanent history
 membership and unused final-word bits. Explicit FIFO expectations check list
 ordering. Production queries never perform this full validation scan.
 
-Stage 4 preserves the previous 48 cases and adds 20 C contract cases, nine
-C-specific cases and one A/B/C cross-check: 78 cases total. C-specific coverage:
+The verifier contains 20 contract cases per implementation, seven B-specific
+cases, nine C-specific cases and two cross-checks: 78 cases total. C-specific coverage:
 endpoints/first-last bits; 63/64, 127/128 and 4991/4992 boundaries; all eight final
 word bits plus defensive masking of deliberately poisoned unused bits; best-price
 changes and empty transitions; FIFO node cancellation and bit lifetime; overflow
@@ -283,7 +283,7 @@ depth snapshots at -1, 0, 1, 3 and INT64_MAX after each operation, while checkin
 all three internal invariant sets. It includes invalid requests, overflow/retry,
 ID reuse rejection, word-spanning prices, UINT64_MAX, repeated cancellation and
 complete draining. It is deterministic correctness verification, not a benchmark
-or a substitute for the separate independent reference model added in Stage 5 below.
+or a substitute for the separate independent reference model described below.
 ## Expected complexity and limitations
 
 N = live orders; U = lifetime accepted IDs; L = occupied levels on the relevant
@@ -310,30 +310,19 @@ adversarial collisions can make a full repair O(N log(N+1)), and a history rehas
 can cost O(U). Vector capacity is retained after cancellations. No performance numbers
 are inferred from these bounds.
 
-## Later authorized work and remaining decisions
+## Limitations
 
-Broader differential verification, demo and benchmark are
-not part of Stage 5. Allocation-failure injection remains future work; the initial
-independent reference model and generated valid traces are now implemented.
+C has O(P) construction work and fixed storage even when empty; destruction also
+visits fixed levels and releases live nodes and ID records. Its FIFO nodes still
+allocate. Hash worst cases and permanent history growth apply to every design.
+None is a custom-pool or allocation-free implementation. B's sequence-exhaustion
+policy is explicit above; A/C use list insertion order without a sequence counter.
 
-The benchmark must use exactly 1,000,000 primary operations: 700,000 adds,
-200,000 cancellations of live orders and 100,000 BBO calls. Both depth queries
-run every 100 primary operations. Use identical pre-generated traces, five runs
-per implementation, medians and actual Linux perf analysis. Seed, depth,
-warmup, timing boundaries and metrics still need review. Trace generation and
-correctness checks must remain outside timing, with query results consumed.
-
-C has O(P) construction work and fixed storage even when empty; destruction
-also visits fixed level records in addition to freeing live nodes and ID records.
-Its FIFO nodes still allocate. Hash worst cases and history growth apply to C
-as well; bitmap discovery scans up to 79 words per side. This is not a pool or
-an allocation-free book. No performance advantage is claimed without measurement.
-
-Reviewer questions: approve C's implementation, any timestamp requirement,
-B's sequence-exhaustion policy, allocation-failure test scope, and final
-benchmark parameters. No benchmark results or screenshots exist at this stage.
-
-## Stage 5 independent randomized verifier
+Allocation-failure injection, exhaustive state exploration, independent sparse-ID
+random traces, production tail latency and controlled native Linux measurements
+are not covered. There are no pending alternate API decisions in this submission.
+Screenshot collection is separately blocked as documented in screenshots/README.md.
+## Independent randomized verifier
 
 verify.cpp retains all 78 deterministic cases and adds --random, --ops and --seed.
 The defaults are 100000 primary operations and seed 42. Each random invocation
@@ -378,10 +367,10 @@ Mismatch diagnostics include seed, operation index, details, implementation and
 expected/observed result or first differing level/size. Unexpected production
 exceptions also identify the responsible implementation. Main returns nonzero
 on verification or CLI errors. Numeric parsing rejects malformed, negative or
-out-of-range uint64 values; no production CLI or benchmark is introduced.
+out-of-range uint64 values; this verifier is separate from the benchmark executable.
 
 Finite seeds do not prove correctness. Random operations are valid and use small
 quantities; the deterministic cases provide invalid-input and overflow coverage.
 Allocation fault injection, large-scale sparse-ID random traces, and exhaustive
-state exploration remain outside this stage. See README for executed commands
+state exploration are not covered. See README for executed commands
 and observed results.
