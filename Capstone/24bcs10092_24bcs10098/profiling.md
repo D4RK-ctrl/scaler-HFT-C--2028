@@ -1,13 +1,12 @@
-# Stage 7 — selected-implementation Linux perf profiling
+# Linux perf profiling
 
 Daksh Shah — 24bcs10092 — shah.24bcs10092@sst.scaler.com
 Tirth Bhalani — 24bcs10098 — tirth.24bcs10098@sst.scaler.com
 
-Stage 6 benchmark timings in benchmark.md are unchanged. This report concerns
-separate, authentic whole-process user-space perf measurements collected on
-17 October 2026. No screenshots or core algorithm changes are included.
+These whole-process user-space perf measurements were collected on
+17 October 2026. Replay-only benchmark results are in benchmark.md.
 
-## Isolation and approved fixture
+## Profiling mode and fixed workload
 
 bench now accepts --profile-only. This branch constructs and replays only the
 selected implementation; it never runs the standard untimed A/B/C validation
@@ -15,7 +14,7 @@ loop. Standard mode retains its original cross-validation and measurement paths.
 
 Profile-only supports only ops=1000000, seed=42 and runs=1 (runs defaults to 1
 when omitted). Other inputs are rejected before trace generation. This restriction
-makes the expected outcome an explicit approved Stage 6 fixture, not a fabricated
+makes the expected outcome an explicit fixed benchmark fixture, not a fabricated
 oracle for arbitrary seeds. It validates trace fingerprint 1002121172284863879,
 checksum 12750139682901687748 and BBO bid 9999:2988 / ask 10001:2344. The checksum
 also consumes final full-depth snapshots. Add/cancel result checking and all
@@ -50,7 +49,7 @@ sh scripts/profile.sh
 ```
 
 The separate profiling build retains -std=c++17 -O2 -DNDEBUG and adds debug
-symbols/frame pointers for readable stacks. It is not the original Stage 6
+symbols/frame pointers for readable stacks. It is not the original the replay benchmark
 measurement binary. The committed script gives exact repeated commands for
 A, B and C; each commands one selected replay per process and runs sequentially.
 For each implementation, the main stat command is:
@@ -183,7 +182,7 @@ All pairs had 100.00% running time, so no multiplex scaling adjustment was neede
   these differ from CPU cache and TLB misses and do not distinguish minor/major
   faults here. A/B/C means were 30809/28728/30692. They include startup, trace
   creation/audit and fresh allocations; the zero replay-only deltas after warmed
-  validation in Stage 6 are a different scope and are not contradicted.
+  validation in the replay benchmark are a different scope and are not contradicted.
 
 These are observed associations plus architectural interpretation, not proof
 that one particular code path caused each miss. Native Linux repeat measurements
@@ -241,8 +240,7 @@ A/C sample counts and unresolved system frames limit fine-grained conclusions.
 The complete final script reports exit 0 for every requested stat pass, paired
 stat pass, recording and report. All 30 counter-run processes (five requested
 plus five paired, per implementation) and all three recording processes printed
-the approved fixture PASS; none printed an untimed cross-implementation pass.
+the benchmark fixture PASS; none printed an untimed cross-implementation pass.
 No event was unsupported, no multiplexing was reported, and no kernel security
 restriction was disabled. The separate standard-mode runs also passed their
-original A/B/C validations. No core implementation or Stage 6 timing report was
-changed, and no screenshots were produced.
+original A/B/C validations. The profiling measurements use the same workload as the replay benchmark.
