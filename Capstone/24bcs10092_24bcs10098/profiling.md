@@ -232,8 +232,8 @@ still clearly reaches its depth sorting; no A/C depth sorting was introduced.
 
 Local text excerpts are in profiling/report-{A,B,C}-{self,stacks}.txt. They trim
 line ends and abbreviate very long symbol names at 240 characters, labelled in
-the files; full original reports remain in build-profile/evidence. The sample counts above come from the original perf record logs retained locally under the ignored build-profile/evidence directory. Small
-A/C sample counts and unresolved system frames limit fine-grained conclusions.
+the files; full original reports remain in build-profile/evidence. The sample counts above come from the original perf record logs in the ignored
+build-profile/evidence directory. Small A/C sample counts and unresolved system frames limit fine-grained conclusions.
 
 ## Outcome and scope audit
 
@@ -243,4 +243,4 @@ plus five paired, per implementation) and all three recording processes printed
 the benchmark fixture PASS; none printed an untimed cross-implementation pass.
 No event was unsupported, no multiplexing was reported, and no kernel security
 restriction was disabled. The separate standard-mode runs also passed their
-original A/B/C validations. The profiling measurements use the same workload as the replay benchmark.
+A/B/C validations. These measurements use the same workload as the replay benchmark.
