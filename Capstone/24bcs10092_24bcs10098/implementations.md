@@ -1,7 +1,7 @@
-# Implementation architecture — Stage 2
+# Implementation architecture — Stage 3
 
-Implementation A is implemented. B and C remain independent proposed designs;
-no B/C code, cross-implementation verification, benchmark or profiling exists yet.
+Implementations A and B are implemented independently. C remains proposed only.
+An initial deterministic A/B cross-check exists; no benchmark or profiling exists.
 
 ## Scope and common API
 
@@ -28,11 +28,11 @@ levels, bids descending and asks ascending. Depth counts distinct prices, not
 orders. Queries do not mutate the book. Old BBO/depth snapshots remain valid and
 unchanged after book mutations; modifying a snapshot cannot modify the book.
 
-## Implemented A contract
+## Shared A/B contract
 
-| Case | Actual A behavior |
+| Case | Actual A/B behavior |
 | --- | --- |
-| Valid add | Append the full resting order; return `added`. |
+| Valid add | Store the full resting order; return `added`. |
 | Invalid enum side | Return `invalid_side`. |
 | Price outside the inclusive side range | Return `invalid_price`. |
 | Quantity <= 0 | Return `invalid_quantity`. |
@@ -111,23 +111,93 @@ add/cancel. A friend test-access struct is defined only in verification code; it
 does not add operations to the public API. Tests use runtime checks rather than
 assert, so Release `-DNDEBUG` does not disable them. They cover both sides, empty
 books, endpoints, invalid inputs, all cancellation positions, history, overflow,
-owned snapshots and dispatch through the abstract interface. They are not B/C or
-random differential tests.
+owned snapshots and dispatch through the abstract interface. The original 20 A cases are preserved as a shared templated suite and also run
+against B. C has no tests. These are not random differential tests.
 
-## B. Indexed binary heaps — proposed only
+## B. Indexed binary heaps — implemented
 
-Separate vector-backed order heaps prioritize best price then arrival sequence.
-An ID hash index stores side and heap position; swaps repair both affected
-positions. Cancellation replaces the target with the last element and repairs
-heap order. A separate aggregate hash per side caches price totals, so BBO reads
-the root price then its aggregate. Depth copies all occupied aggregate levels,
-sorts best-first and truncates. A permanent accepted-ID set enforces ID lifetime.
+`impl_b/orderbook_b.hpp` and `.cpp` define `OrderBookB`, independently of A.
+Each side stores individual orders in a contiguous `vector<Entry>`. An entry
+contains the shared `Order` and an internal uint64_t arrival sequence. Bids
+prioritize higher prices, asks lower prices; price ties prioritize smaller
+sequences. IDs do not determine priority. Copy/move are disabled for a simple
+instance-lifetime policy consistent with A.
 
-This differs from a map ordering structure. Concerns are synchronizing heap,
-positions, totals and history, plus O(L log L) depth even for a shallow request.
-Without cached aggregates BBO quantity would require scanning orders. No B
-implementation or sequence-exhaustion policy is finalized at Stage 2.
+`live_` maps ID to side and vector position. `bid_totals_` and `ask_totals_`
+are unordered price-to-quantity maps, never ordered maps. `used_ids_` retains
+all accepted IDs permanently, independently of whether their orders are live.
+The production B implementation does not depend on A or use std::map.
 
+### Five operations and cancellation
+
+- Add uses the same validation precedence and enum results as A, appends an
+  entry, creates its index/history/aggregate records, and sifts upward.
+- Cancel locates the order immediately, swaps it with the last entry, updates
+  both position records, pops the vector, erases its live record, and subtracts
+  its aggregate. A zero total removes that price record. If a replacement
+  remains, it sifts upward when better than its parent, otherwise downward.
+  There are no tombstones, lazy deletion or stale heap entries.
+- Every heap swap updates both affected ID positions. Vector growth changes
+  addresses but not indexed positions; no pointers into vector storage are kept.
+- BBO reads each heap root's price and the corresponding aggregate total, or
+  returns an absent optional side. No scan over same-price orders is needed.
+- Bid/ask depth copies only occupied aggregate levels, sorts by price best-first,
+  and truncates to depth. A nonpositive request returns before allocation.
+  Even depth 1 copies/sorts all occupied levels; returned snapshots own their data.
+
+### Allocation ordering and exception safety
+
+All validation and sequence-exhaustion checks happen before mutation. An Entry
+contains only trivial scalar fields, so vector push_back can grow with its strong
+exception guarantee. If that succeeds, no heap movement occurs yet. The code then:
+
+1. Creates/finds an aggregate record (a new one initially has total zero).
+2. Inserts the accepted-ID record.
+3. Inserts the live ID/position record.
+4. Commits the aggregate quantity and increments the sequence, then sifts up.
+
+If steps 1-3 throw, completed history/aggregate insertions are erased and the
+provisional vector entry is popped. If vector growth itself throws, no index
+has yet changed. Existing aggregate totals and next sequence are not modified
+until all allocations complete. No further allocations occur during commit or
+sifting: Entry swaps are trivial, integer arithmetic is prechecked and existing
+position records use find rather than insertion. Fixed integral hash/equality
+operations do not throw. Cancellation likewise needs no allocation.
+
+This strategy is intended to preserve logical state on allocation failure;
+vector capacity and hash bucket counts may remain larger. Allocation failure
+has not been injected deterministically in the tests, so exception-path coverage
+is a known limitation, not a fault-injection-verified guarantee. Query allocation
+failure leaves the book unchanged. Internal logic_error checks indicate an index
+invariant bug, not a normal user-input error.
+
+Sequence values 0..UINT64_MAX-1 are available. Once next_seq_ reaches UINT64_MAX,
+a business-valid new order throws overflow_error before mutation or ID consumption;
+there is no wraparound or renumbering. Business-invalid adds still return their
+normal validation result first. Sequence exhaustion is tested via friend access.
+A uses list order and has no equivalent sequence limit.
+
+### B invariants and deterministic tests
+
+The B test-access struct is defined only in verify.cpp. It independently checks
+heap ordering, unique arrival sequences, every ID-to-position locator, legal
+order fields, permanent history membership, heap/live counts and recomputed
+per-price totals against the aggregate hash tables. FIFO IDs are reconstructed
+by sequence, and explicit root-draining tests verify tie priority itself.
+
+There are 48 named cases in total: the original 20 A contract cases, the same
+20 applied to B, seven B-specific cases and one deterministic A/B cross-check.
+The B-specific cases cover root/downward repair, middle/upward repair,
+middle/downward repair, last-element removal, FIFO root order, 256-order
+repeated-swap/growth/locator consistency, and sequence exhaustion. Each applicable
+repair fixture runs on both sides. Overflow tests retry the rejected ID and check
+unchanged snapshots/history. All runtime checks remain enabled under NDEBUG.
+
+The A/B cross-check compares add/cancel results, BBO presence/prices/quantities
+and both depth snapshots at depths -1, 0, 1, 3 and INT64_MAX after every operation.
+It covers invalid input, overflow/retry, cancelled-ID rejection, repeated prices,
+unknown/repeated cancellation and complete draining. This is initial verification,
+not an independent reference model or a benchmark; shared bugs remain possible.
 ## C. Tick arrays and occupancy bitmap — proposed only
 
 Each side has 5,000 fixed levels, FIFO order lists and totals. Tick offsets are
@@ -146,7 +216,7 @@ N = live orders; U = lifetime accepted IDs; L = occupied levels on the relevant
 side; K = min(positive depth, L); P = 5,000; W = ceil(P/64) = 79 per side.
 Hash costs below are expected amortized, not hard latency guarantees.
 
-| Operation | A: implemented | B: proposed | C: proposed |
+| Operation | A: implemented | B: implemented | C: proposed |
 | --- | --- | --- | --- |
 | Add | O(log(L+1)) | O(log(N+1)) | O(1) |
 | Cancel | O(1) amortized | O(log(N+1)) | O(1) |
@@ -160,13 +230,16 @@ A's map erase by iterator is amortized constant, not a guarantee for every call.
 Its list and map nodes allocate separately and cause pointer chasing. Hash
 collisions can make live lookup O(N) and history lookup O(U); rehashing and
 allocation cause latency spikes. Permanent history memory grows even as orders
-are cancelled. B may also reallocate its heap vector. No performance numbers
+are cancelled. B may also reallocate its heap vector and sort all occupied levels
+on shallow depth requests. Each heap swap performs two locator hash lookups;
+adversarial collisions can make a full repair O(N log(N+1)), and a history rehash
+can cost O(U). Vector capacity is retained after cancellations. No performance numbers
 are inferred from these bounds.
 
 ## Later authorized work and remaining decisions
 
-B/C implementation, cross-implementation verification, demo and benchmark are
-not part of Stage 2. Future verification should add an independent reference
+C implementation, broader differential verification, demo and benchmark are
+not part of Stage 3. Future verification should add an independent reference
 model, generated traces and allocation-failure injection.
 
 The benchmark must use exactly 1,000,000 primary operations: 700,000 adds,
@@ -176,6 +249,6 @@ per implementation, medians and actual Linux perf analysis. Seed, depth,
 warmup, timing boundaries and metrics still need review. Trace generation and
 correctness checks must remain outside timing, with query results consumed.
 
-Reviewer questions: approve current A behavior, future B's aggregate/hash/sort
-tradeoff, any timestamp requirement, sequence exhaustion for B, and final
+Reviewer questions: approve B's implementation and aggregate/hash/sort
+tradeoff, any timestamp requirement, B's sequence-exhaustion policy, and final
 benchmark parameters. No benchmark results or screenshots exist at this stage.

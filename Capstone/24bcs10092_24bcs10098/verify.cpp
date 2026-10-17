@@ -1,5 +1,8 @@
 #include "impl_a/orderbook_a.hpp"
+#include "impl_b/orderbook_b.hpp"
 
+#include <algorithm>
+#include <map>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -60,10 +63,72 @@ struct OrderBookATestAccess {
     static std::size_t used_count(const OrderBookA& book) { return book.used_ids_.size(); }
 };
 
+struct OrderBookBTestAccess {
+    static bool valid(const OrderBookB& book) {
+        std::size_t count = 0;
+        std::unordered_set<std::uint64_t> seqs;
+        for (Side side : {Side::bid, Side::ask}) {
+            const auto& heap = side == Side::bid ? book.bids_ : book.asks_;
+            const auto& totals = side == Side::bid ? book.bid_totals_ : book.ask_totals_;
+            std::map<PriceTicks, Quantity> expected;
+            for (std::size_t pos = 0; pos < heap.size(); ++pos) {
+                const auto& entry = heap[pos]; const auto& order = entry.order;
+                const auto lo = side == Side::bid ? min_bid_ticks : min_ask_ticks;
+                const auto hi = side == Side::bid ? max_bid_ticks : max_ask_ticks;
+                if (order.side != side || order.price < lo || order.price > hi || order.quantity <= 0)
+                    return false;
+                if (!seqs.insert(entry.seq).second || entry.seq >= book.next_seq_) return false;
+                const auto loc = book.live_.find(order.id);
+                if (loc == book.live_.end() || loc->second.side != side || loc->second.pos != pos ||
+                    book.used_ids_.count(order.id) != 1) return false;
+                if (pos > 0) {
+                    const auto& parent = heap[(pos - 1) / 2];
+                    const bool better_price = side == Side::bid ? order.price > parent.order.price
+                                                               : order.price < parent.order.price;
+                    if (better_price || (order.price == parent.order.price && entry.seq < parent.seq))
+                        return false;
+                }
+                auto& sum = expected[order.price];
+                if (order.quantity > std::numeric_limits<Quantity>::max() - sum) return false;
+                sum += order.quantity; ++count;
+            }
+            if (expected.size() != totals.size()) return false;
+            for (const auto& level : expected) {
+                const auto actual = totals.find(level.first);
+                if (actual == totals.end() || actual->second != level.second) return false;
+            }
+        }
+        return count == book.live_.size() && book.used_ids_.size() >= count;
+    }
+    static std::vector<OrderId> fifo(const OrderBookB& book, Side side, PriceTicks price) {
+        const auto& heap = side == Side::bid ? book.bids_ : book.asks_;
+        std::vector<std::pair<std::uint64_t, OrderId>> arrivals;
+        for (const auto& entry : heap)
+            if (entry.order.price == price) arrivals.push_back({entry.seq, entry.order.id});
+        std::sort(arrivals.begin(), arrivals.end());
+        std::vector<OrderId> ids;
+        for (const auto& entry : arrivals) ids.push_back(entry.second);
+        return ids;
+    }
+    static std::size_t used_count(const OrderBookB& book) { return book.used_ids_.size(); }
+    static OrderId at(const OrderBookB& book, Side side, std::size_t pos) {
+        return (side == Side::bid ? book.bids_ : book.asks_).at(pos).order.id;
+    }
+    static std::size_t size(const OrderBookB& book, Side side) {
+        return (side == Side::bid ? book.bids_ : book.asks_).size();
+    }
+    static void exhaust_sequence(OrderBookB& book) {
+        book.next_seq_ = std::numeric_limits<std::uint64_t>::max();
+    }
+};
 } // namespace orderbook
 
 namespace {
 using namespace orderbook;
+template <typename Book>
+using Access = std::conditional_t<std::is_same_v<Book, OrderBookA>,
+                                  OrderBookATestAccess, OrderBookBTestAccess>;
+
 constexpr Quantity max_qty = std::numeric_limits<Quantity>::max();
 constexpr Depth all_depth = std::numeric_limits<Depth>::max();
 
@@ -89,60 +154,64 @@ void quote(const std::optional<PriceLevel>& actual, PriceTicks price, Quantity q
     require(actual->price == price && actual->total_quantity == qty, "incorrect BBO level");
 }
 
-void add(OrderBookA& book, OrderId id, Side side, PriceTicks price, Quantity qty,
+template <typename Book>
+void add(Book& book, OrderId id, Side side, PriceTicks price, Quantity qty,
          AddResult expected = AddResult::added) {
     const auto bids = book.get_bids(all_depth);
     const auto asks = book.get_asks(all_depth);
-    const auto used = OrderBookATestAccess::used_count(book);
+    const auto used = Access<Book>::used_count(book);
     require(book.add_order({id, side, price, qty}) == expected, "unexpected add result");
-    require(OrderBookATestAccess::valid(book), "invariant violation after add");
+    require(Access<Book>::valid(book), "invariant violation after add");
     if (expected != AddResult::added) {
         levels(book.get_bids(all_depth), bids);
         levels(book.get_asks(all_depth), asks);
-        require(OrderBookATestAccess::used_count(book) == used, "rejection consumed an ID");
+        require(Access<Book>::used_count(book) == used, "rejection consumed an ID");
     }
 }
 
-void cancel(OrderBookA& book, OrderId id, CancelResult expected = CancelResult::cancelled) {
+template <typename Book>
+void cancel(Book& book, OrderId id, CancelResult expected = CancelResult::cancelled) {
     const auto bids = book.get_bids(all_depth);
     const auto asks = book.get_asks(all_depth);
-    const auto used = OrderBookATestAccess::used_count(book);
+    const auto used = Access<Book>::used_count(book);
     require(book.cancel_order(id) == expected, "unexpected cancellation result");
-    require(OrderBookATestAccess::valid(book), "invariant violation after cancel");
-    require(OrderBookATestAccess::used_count(book) == used, "cancel changed accepted-ID history");
+    require(Access<Book>::valid(book), "invariant violation after cancel");
+    require(Access<Book>::used_count(book) == used, "cancel changed accepted-ID history");
     if (expected == CancelResult::not_found) {
         levels(book.get_bids(all_depth), bids);
         levels(book.get_asks(all_depth), asks);
     }
 }
 
-void fifo(const OrderBookA& book, Side side, PriceTicks price, std::vector<OrderId> expected) {
-    require(OrderBookATestAccess::fifo(book, side, price) == expected, "FIFO sequence differs");
+template <typename Book>
+void fifo(const Book& book, Side side, PriceTicks price, std::vector<OrderId> expected) {
+    require(Access<Book>::fifo(book, side, price) == expected, "FIFO sequence differs");
 }
 
 } // namespace
 
-int main() {
+template <typename Book>
+int run_contract(const char* name) {
     using namespace orderbook;
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"initial empty book", [] {
-            OrderBookA b;
+            Book b;
             require(!b.get_bbo().bid && !b.get_bbo().ask, "empty book has a quote");
             levels(b.get_bids(10), {}); levels(b.get_asks(10), {});
-            require(OrderBookATestAccess::valid(b), "empty invariants");
+            require(Access<Book>::valid(b), "empty invariants");
         }},
         {"first bid and ID zero", [] {
-            OrderBookA b; add(b, 0, Side::bid, 9000, 7);
+            Book b; add(b, 0, Side::bid, 9000, 7);
             quote(b.get_bbo().bid, 9000, 7); require(!b.get_bbo().ask, "unexpected ask");
             levels(b.get_bids(1), {{9000, 7}}); levels(b.get_asks(1), {});
         }},
         {"first ask with independent empty bid", [] {
-            OrderBookA b; add(b, 1, Side::ask, 11000, 9);
+            Book b; add(b, 1, Side::ask, 11000, 9);
             quote(b.get_bbo().ask, 11000, 9); require(!b.get_bbo().bid, "unexpected bid");
             levels(b.get_asks(1), {{11000, 9}}); levels(b.get_bids(1), {});
         }},
         {"best prices change on add and cancel", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 8000, 3); add(b, 2, Side::bid, 9900, 4);
             add(b, 3, Side::ask, 14000, 5); add(b, 4, Side::ask, 10100, 6);
             quote(b.get_bbo().bid, 9900, 4); quote(b.get_bbo().ask, 10100, 6);
@@ -150,14 +219,14 @@ int main() {
             quote(b.get_bbo().bid, 8000, 3); quote(b.get_bbo().ask, 14000, 5);
         }},
         {"same-price aggregates on both sides", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 9000, 7); add(b, 2, Side::bid, 9000, 11);
             add(b, 3, Side::ask, 11000, 13); add(b, 4, Side::ask, 11000, 17);
             levels(b.get_bids(10), {{9000, 18}}); levels(b.get_asks(10), {{11000, 30}});
             quote(b.get_bbo().bid, 9000, 18); quote(b.get_bbo().ask, 11000, 30);
         }},
         {"bid FIFO first middle last cancellation", [] {
-            OrderBookA b;
+            Book b;
             add(b, 90, Side::bid, 9000, 2); add(b, 10, Side::bid, 9000, 3);
             add(b, 70, Side::bid, 9000, 5); add(b, 20, Side::bid, 9000, 7);
             add(b, 50, Side::bid, 9000, 11);
@@ -169,7 +238,7 @@ int main() {
             add(b, 5, Side::bid, 9000, 13); fifo(b, Side::bid, 9000, {10, 20, 5});
         }},
         {"ask FIFO first middle last cancellation", [] {
-            OrderBookA b;
+            Book b;
             add(b, 8, Side::ask, 11000, 2); add(b, 2, Side::ask, 11000, 3);
             add(b, 7, Side::ask, 11000, 5); add(b, 1, Side::ask, 11000, 7);
             add(b, 6, Side::ask, 11000, 11);
@@ -178,7 +247,7 @@ int main() {
             fifo(b, Side::ask, 11000, {2, 1}); levels(b.get_asks(10), {{11000, 10}});
         }},
         {"final orders remove levels and empty sides", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 9999, 2); add(b, 2, Side::bid, 9999, 3);
             add(b, 3, Side::ask, 10001, 4);
             cancel(b, 1); levels(b.get_bids(10), {{9999, 3}});
@@ -189,13 +258,13 @@ int main() {
             add(b, 4, Side::bid, 9999, 8); levels(b.get_bids(10), {{9999, 8}});
         }},
         {"unknown and repeated cancellations", [] {
-            OrderBookA b; cancel(b, 77, CancelResult::not_found);
+            Book b; cancel(b, 77, CancelResult::not_found);
             add(b, 1, Side::bid, 9000, 8); cancel(b, 99, CancelResult::not_found);
             cancel(b, 1); cancel(b, 1, CancelResult::not_found);
             add(b, 77, Side::ask, 11000, 3); quote(b.get_bbo().ask, 11000, 3);
         }},
         {"live and cancelled IDs cannot be reused across sides", [] {
-            OrderBookA b; add(b, 0, Side::bid, 9000, 4);
+            Book b; add(b, 0, Side::bid, 9000, 4);
             add(b, 0, Side::ask, 11000, 6, AddResult::duplicate_id);
             cancel(b, 0);
             add(b, 0, Side::bid, 9000, 4, AddResult::duplicate_id);
@@ -203,7 +272,7 @@ int main() {
             require(!b.get_bbo().bid && !b.get_bbo().ask, "reused ID entered book");
         }},
         {"rejected adds leave IDs available", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 10000, 1, AddResult::invalid_price);
             add(b, 1, Side::bid, 9999, 1);
             add(b, 2, Side::ask, 10001, 0, AddResult::invalid_quantity);
@@ -212,24 +281,24 @@ int main() {
             add(b, 3, Side::bid, 9000, 3);
         }},
         {"all four inclusive price boundaries", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 5000, 1); add(b, 2, Side::bid, 9999, 2);
             add(b, 3, Side::ask, 10001, 3); add(b, 4, Side::ask, 15000, 4);
             levels(b.get_bids(10), {{9999, 2}, {5000, 1}});
             levels(b.get_asks(10), {{10001, 3}, {15000, 4}});
         }},
         {"invalid bid and ask prices", [] {
-            OrderBookA b; OrderId id = 1;
+            Book b; OrderId id = 1;
             for (PriceTicks price : {4999, 10000, 10001, -1,
                                     std::numeric_limits<PriceTicks>::max()})
                 add(b, id++, Side::bid, price, 1, AddResult::invalid_price);
             for (PriceTicks price : {10000, 15001, 9999, -1,
                                     std::numeric_limits<PriceTicks>::min()})
                 add(b, id++, Side::ask, price, 1, AddResult::invalid_price);
-            require(OrderBookATestAccess::used_count(b) == 0, "invalid prices consumed IDs");
+            require(Access<Book>::used_count(b) == 0, "invalid prices consumed IDs");
         }},
         {"zero negative and minimum quantities", [] {
-            OrderBookA b; OrderId id = 1;
+            Book b; OrderId id = 1;
             for (Side side : {Side::bid, Side::ask}) {
                 for (Quantity qty : {Quantity{0}, Quantity{-1}, std::numeric_limits<Quantity>::min()})
                     add(b, id++, side, side == Side::bid ? 9000 : 11000, qty,
@@ -238,14 +307,14 @@ int main() {
             require(!b.get_bbo().bid && !b.get_bbo().ask, "invalid quantity stored");
         }},
         {"invalid sides and validation precedence", [] {
-            OrderBookA b; add(b, 1, Side::bid, 9000, 5);
+            Book b; add(b, 1, Side::bid, 9000, 5);
             add(b, 1, static_cast<Side>(-1), -1, -1, AddResult::invalid_side);
             add(b, 1, Side::bid, 10000, 0, AddResult::invalid_price);
             add(b, 1, Side::bid, 9000, 0, AddResult::invalid_quantity);
             add(b, 1, Side::bid, 9000, 1, AddResult::duplicate_id);
         }},
         {"bid quantity overflow rollback and ID retry", [] {
-            OrderBookA b; add(b, 1, Side::bid, 9000, max_qty - 2);
+            Book b; add(b, 1, Side::bid, 9000, max_qty - 2);
             add(b, 2, Side::bid, 9000, 2); quote(b.get_bbo().bid, 9000, max_qty);
             add(b, 3, Side::bid, 9000, 1, AddResult::quantity_overflow);
             fifo(b, Side::bid, 9000, {1, 2});
@@ -254,14 +323,14 @@ int main() {
             levels(b.get_bids(10), {{9000, max_qty - 1}, {8999, max_qty}});
         }},
         {"ask maximum quantity overflow and recovery", [] {
-            OrderBookA b; add(b, 1, Side::ask, 10001, max_qty);
+            Book b; add(b, 1, Side::ask, 10001, max_qty);
             add(b, 2, Side::ask, 10001, max_qty, AddResult::quantity_overflow);
             quote(b.get_bbo().ask, 10001, max_qty); cancel(b, 1);
             add(b, 2, Side::ask, 10001, max_qty);
             levels(b.get_asks(10), {{10001, max_qty}});
         }},
         {"negative zero normal and oversized depth", [] {
-            OrderBookA b;
+            Book b;
             add(b, 1, Side::bid, 7000, 1); add(b, 2, Side::bid, 9900, 2);
             add(b, 3, Side::bid, 8000, 3); add(b, 4, Side::ask, 14000, 4);
             add(b, 5, Side::ask, 10100, 5); add(b, 6, Side::ask, 12000, 6);
@@ -274,7 +343,7 @@ int main() {
             levels(b.get_asks(all_depth), {{10100, 5}, {12000, 6}, {14000, 4}});
         }},
         {"owned snapshots remain stable after mutations", [] {
-            OrderBookA b; add(b, 1, Side::bid, 9000, 5); add(b, 2, Side::ask, 11000, 7);
+            Book b; add(b, 1, Side::bid, 9000, 5); add(b, 2, Side::ask, 11000, 7);
             auto bids = b.get_bids(10); auto asks = b.get_asks(10); const auto bbo = b.get_bbo();
             cancel(b, 1); cancel(b, 2); add(b, 3, Side::bid, 9999, 11);
             levels(bids, {{9000, 5}}); levels(asks, {{11000, 7}});
@@ -283,28 +352,172 @@ int main() {
             levels(b.get_bids(10), {{9999, 11}}); levels(b.get_asks(10), {});
         }},
         {"uint64 maximum ID and interface dispatch", [] {
-            OrderBookA b; OrderBook& api = b;
+            Book b; OrderBook& api = b;
             const auto id = std::numeric_limits<OrderId>::max();
             require(api.add_order({id, Side::ask, 15000, 8}) == AddResult::added, "dispatch add");
             quote(api.get_bbo().ask, 15000, 8); levels(api.get_asks(1), {{15000, 8}});
             levels(api.get_bids(1), {});
             require(api.cancel_order(id) == CancelResult::cancelled, "dispatch cancel");
             require(api.add_order({id, Side::bid, 5000, 1}) == AddResult::duplicate_id, "ID history");
-            require(OrderBookATestAccess::valid(b), "dispatch invariants");
+            require(Access<Book>::valid(b), "dispatch invariants");
         }}
     };
     std::size_t passed = 0;
     for (const auto& test : tests) {
         try {
             test.second(); ++passed;
-            std::cout << "PASS: " << test.first << '\n';
+            std::cout << name << " PASS: " << test.first << '\n';
         } catch (const std::exception& e) {
-            std::cout << "FAIL: " << test.first << ": " << e.what() << '\n';
+            std::cout << name << " FAIL: " << test.first << ": " << e.what() << '\n';
         } catch (...) {
-            std::cout << "FAIL: " << test.first << ": unknown exception\n";
+            std::cout << name << " FAIL: " << test.first << ": unknown exception\n";
         }
     }
-    std::cout << "Implementation A: " << passed << " PASS, " << tests.size() - passed
-              << " FAIL, " << tests.size() << " tests. B and C not implemented/tested.\n";
+    std::cout << name << ": " << passed << " PASS, " << tests.size() - passed
+              << " FAIL, " << tests.size() << " tests.\n";
     return passed == tests.size() ? 0 : 1;
+}
+
+int run_heap_tests() {
+    const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"root cancellation repairs both heaps downward", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookB b;
+                for (int i = 0; i < 7; ++i)
+                    add(b, static_cast<OrderId>(i + 1), side,
+                        side == Side::bid ? 9900 - i * 100 : 10100 + i * 100, i + 1);
+                require(OrderBookBTestAccess::at(b, side, 0) == 1, "wrong initial root");
+                cancel(b, 1);
+                require(OrderBookBTestAccess::at(b, side, 0) == 2, "replacement did not sift down");
+                require(OrderBookBTestAccess::size(b, side) == 6, "not immediately removed");
+            }
+        }},
+        {"middle cancellation repairs upward on both sides", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookB b; OrderId id = 1;
+                for (int priority : {100, 50, 90, 20, 40, 80, 85})
+                    add(b, id++, side, side == Side::bid ? 9000 + priority : 11000 - priority, 1);
+                require(OrderBookBTestAccess::at(b, side, 3) == 4, "upward fixture changed");
+                require(OrderBookBTestAccess::at(b, side, 6) == 7, "replacement fixture changed");
+                cancel(b, 4);
+                require(OrderBookBTestAccess::at(b, side, 1) == 7, "replacement did not sift up");
+            }
+        }},
+        {"middle cancellation repairs downward on both sides", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookB b; OrderId id = 1;
+                for (int priority : {100, 90, 80, 70, 60, 50, 40})
+                    add(b, id++, side, side == Side::bid ? 9000 + priority : 11000 - priority, 1);
+                cancel(b, 2);
+                require(OrderBookBTestAccess::at(b, side, 1) == 4, "child did not move upward");
+                require(OrderBookBTestAccess::at(b, side, 3) == 7, "replacement did not move downward");
+            }
+        }},
+        {"last-element cancellation needs no repair", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookB b;
+                add(b, 1, side, side == Side::bid ? 9900 : 10100, 2);
+                add(b, 2, side, side == Side::bid ? 9800 : 10200, 3);
+                add(b, 3, side, side == Side::bid ? 9700 : 10300, 4);
+                cancel(b, 3);
+                require(OrderBookBTestAccess::at(b, side, 0) == 1 &&
+                        OrderBookBTestAccess::at(b, side, 1) == 2, "last removal moved another order");
+                cancel(b, 2); cancel(b, 1);
+                require(OrderBookBTestAccess::size(b, side) == 0, "heap not empty");
+            }
+        }},
+        {"equal-price roots follow insertion sequence", [] {
+            for (Side side : {Side::bid, Side::ask}) {
+                OrderBookB b; const PriceTicks price = side == Side::bid ? 9000 : 11000;
+                for (OrderId id : {OrderId{90}, OrderId{10}, OrderId{70}, OrderId{20}})
+                    add(b, id, side, price, 3);
+                for (OrderId expected : {OrderId{90}, OrderId{10}, OrderId{70}, OrderId{20}}) {
+                    require(OrderBookBTestAccess::at(b, side, 0) == expected, "tie order is not FIFO");
+                    cancel(b, expected);
+                }
+            }
+        }},
+        {"repeated swaps growth and locator lookup", [] {
+            OrderBookB b;
+            for (OrderId id = 1; id <= 256; ++id) {
+                const Side side = id % 2 == 0 ? Side::bid : Side::ask;
+                const auto offset = static_cast<PriceTicks>((id * 37) % 5000);
+                add(b, id, side, side == Side::bid ? 5000 + offset : 10001 + offset, 1);
+            }
+            // Odd stride permutes all 256 IDs; targets move repeatedly before cancellation.
+            for (OrderId i = 0; i < 256; ++i) cancel(b, (i * 73) % 256 + 1);
+            require(!b.get_bbo().bid && !b.get_bbo().ask, "stress book not empty");
+            require(OrderBookBTestAccess::used_count(b) == 256, "lost accepted history");
+            add(b, 1, Side::bid, 9000, 1, AddResult::duplicate_id);
+        }},
+        {"sequence exhaustion is detected without mutation", [] {
+            OrderBookB b; add(b, 1, Side::bid, 9000, 4);
+            OrderBookBTestAccess::exhaust_sequence(b);
+            bool caught = false;
+            try { b.add_order({2, Side::ask, 11000, 5}); }
+            catch (const std::overflow_error&) { caught = true; }
+            require(caught, "sequence exhaustion was not detected");
+            levels(b.get_bids(10), {{9000, 4}}); levels(b.get_asks(10), {});
+            require(OrderBookBTestAccess::used_count(b) == 1, "exhaustion consumed ID");
+            require(OrderBookBTestAccess::valid(b), "exhaustion corrupted invariants");
+            add(b, 2, Side::ask, 11000, 0, AddResult::invalid_quantity);
+        }},
+        {"deterministic A-B cross-verification after every operation", [] {
+            OrderBookA a; OrderBookB b;
+            auto compare = [&] {
+                const auto x = a.get_bbo(); const auto y = b.get_bbo();
+                require(x.bid.has_value() == y.bid.has_value() &&
+                        x.ask.has_value() == y.ask.has_value(), "A/B BBO presence differs");
+                if (x.bid) quote(y.bid, x.bid->price, x.bid->total_quantity);
+                if (x.ask) quote(y.ask, x.ask->price, x.ask->total_quantity);
+                for (Depth d : {Depth{-1}, Depth{0}, Depth{1}, Depth{3}, all_depth}) {
+                    levels(b.get_bids(d), a.get_bids(d)); levels(b.get_asks(d), a.get_asks(d));
+                }
+                require(OrderBookATestAccess::valid(a) && OrderBookBTestAccess::valid(b),
+                        "A/B internal invariant failure");
+            };
+            auto insert = [&](Order order) {
+                require(a.add_order(order) == b.add_order(order), "A/B add results differ"); compare();
+            };
+            auto erase = [&](OrderId id) {
+                require(a.cancel_order(id) == b.cancel_order(id), "A/B cancel results differ"); compare();
+            };
+            compare();
+            insert({0, Side::bid, 9999, 3}); insert({1, Side::ask, 10001, max_qty});
+            insert({2, Side::ask, 10001, 1}); erase(1);
+            insert({2, Side::ask, 10001, 1}); insert({1, Side::ask, 11000, 1});
+            insert({3, static_cast<Side>(5), 9000, 1});
+            insert({3, Side::bid, 10000, 1}); insert({3, Side::bid, 9000, 0});
+            insert({3, Side::bid, 9000, 5}); erase(999);
+            for (OrderId id = 10; id < 138; ++id) {
+                const Side side = id % 2 == 0 ? Side::bid : Side::ask;
+                const auto offset = static_cast<PriceTicks>((id * 19) % 17);
+                insert({id, side, side == Side::bid ? 8000 + offset : 12000 + offset,
+                        static_cast<Quantity>(id % 7 + 1)});
+                if (id >= 14 && id % 3 == 0) erase(id - 4);
+            }
+            for (OrderId id = 10; id < 138; ++id) { erase(id); erase(id); }
+            erase(0); erase(2); erase(3);
+            require(!a.get_bbo().bid && !a.get_bbo().ask, "cross-check did not drain book");
+        }}
+    };
+    std::size_t passed = 0;
+    for (const auto& test : tests) {
+        try { test.second(); ++passed; std::cout << "B-specific PASS: " << test.first << '\n'; }
+        catch (const std::exception& e) {
+            std::cout << "B-specific FAIL: " << test.first << ": " << e.what() << '\n';
+        }
+    }
+    std::cout << "B-specific/cross-check: " << passed << " PASS, " << tests.size() - passed
+              << " FAIL, " << tests.size() << " tests.\n";
+    return passed == tests.size() ? 0 : 1;
+}
+
+int main() {
+    const int a = run_contract<orderbook::OrderBookA>("A contract");
+    const int b = run_contract<orderbook::OrderBookB>("B contract");
+    const int heaps = run_heap_tests();
+    std::cout << "Total: 48 cases (20 A, 20 B contract, 7 B-specific, 1 A/B cross-check). "
+                 "C not implemented/tested.\n";
+    return a || b || heaps;
 }
