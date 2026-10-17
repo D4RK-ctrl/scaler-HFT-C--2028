@@ -3,6 +3,11 @@
 #include "impl_c/orderbook_c.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <random>
+#include <sstream>
+#include <string_view>
 #include <map>
 #include <functional>
 #include <iostream>
@@ -745,7 +750,7 @@ int run_bitmap_tests() {
     return passed == tests.size() ? 0 : 1;
 }
 
-int main() {
+int run_deterministic() {
     const int a = run_contract<orderbook::OrderBookA>("A contract");
     const int b = run_contract<orderbook::OrderBookB>("B contract");
     const int c = run_contract<orderbook::OrderBookC>("C contract");
@@ -754,4 +759,281 @@ int main() {
     std::cout << "Total: 78 cases (20 A, 20 B contract, 20 C contract, 7 B-specific, "
                  "9 C-specific, 1 A/B cross-check, 1 A/B/C cross-check).\n";
     return a || b || c || heaps || bitmap;
+}
+
+namespace {
+// Independent oracle for the generated dense-ID trace: append-only order records
+// and ascending sorted vectors of aggregate levels. No tree, heap, bitmap,
+// production locator, or production query helper is used.
+class ReferenceModel {
+    struct Record { Order order; bool active; };
+    std::vector<Record> records_;
+    DepthSnapshot bids_;
+    DepthSnapshot asks_;
+
+    static auto find_level(DepthSnapshot& levels, PriceTicks price) {
+        return std::lower_bound(levels.begin(), levels.end(), price,
+            [](const PriceLevel& level, PriceTicks p) { return level.price < p; });
+    }
+
+public:
+    AddResult add_order(const Order& order) {
+        if (order.side != Side::bid && order.side != Side::ask) return AddResult::invalid_side;
+        if (order.price < (order.side == Side::bid ? 5000 : 10001) ||
+            order.price > (order.side == Side::bid ? 9999 : 15000)) return AddResult::invalid_price;
+        if (order.quantity <= 0) return AddResult::invalid_quantity;
+        if (order.id < records_.size()) return AddResult::duplicate_id;
+        if (order.id != records_.size()) throw std::runtime_error("oracle requires dense trace IDs");
+        auto& levels = order.side == Side::bid ? bids_ : asks_;
+        auto level = find_level(levels, order.price);
+        if (level != levels.end() && level->price == order.price) {
+            if (order.quantity > max_qty - level->total_quantity) return AddResult::quantity_overflow;
+            level->total_quantity += order.quantity;
+        } else {
+            levels.insert(level, {order.price, order.quantity});
+        }
+        records_.push_back({order, true});
+        return AddResult::added;
+    }
+
+    CancelResult cancel_order(OrderId id) {
+        if (id >= records_.size() || !records_[static_cast<std::size_t>(id)].active)
+            return CancelResult::not_found;
+        auto& record = records_[static_cast<std::size_t>(id)];
+        auto& levels = record.order.side == Side::bid ? bids_ : asks_;
+        auto level = find_level(levels, record.order.price);
+        require(level != levels.end() && level->price == record.order.price, "oracle missing level");
+        level->total_quantity -= record.order.quantity;
+        if (level->total_quantity == 0) levels.erase(level);
+        record.active = false; // The record itself is permanent ID history.
+        return CancelResult::cancelled;
+    }
+
+    Bbo get_bbo() const {
+        Bbo result;
+        if (!bids_.empty()) result.bid = bids_.back();
+        if (!asks_.empty()) result.ask = asks_.front();
+        return result;
+    }
+    DepthSnapshot depth(Side side, Depth count) const {
+        DepthSnapshot result;
+        if (count <= 0) return result;
+        const auto& levels = side == Side::bid ? bids_ : asks_;
+        const auto size = std::min<Depth>(count, static_cast<Depth>(levels.size()));
+        for (Depth i = 0; i < size; ++i) {
+            const auto pos = side == Side::bid ? levels.size() - 1 - static_cast<std::size_t>(i)
+                                              : static_cast<std::size_t>(i);
+            result.push_back(levels[pos]);
+        }
+        return result;
+    }
+    bool audit(std::size_t expected_live) const {
+        std::size_t live = 0;
+        for (Side side : {Side::bid, Side::ask}) {
+            DepthSnapshot rebuilt;
+            for (const auto& record : records_) {
+                if (record.active && record.order.side == side) {
+                    rebuilt.push_back({record.order.price, record.order.quantity}); ++live;
+                }
+            }
+            std::sort(rebuilt.begin(), rebuilt.end(), [](const PriceLevel& a, const PriceLevel& b) {
+                return a.price < b.price;
+            });
+            DepthSnapshot sums;
+            for (const auto& level : rebuilt) {
+                if (!sums.empty() && sums.back().price == level.price)
+                    sums.back().total_quantity += level.total_quantity;
+                else sums.push_back(level);
+            }
+            if (!same_levels(sums, side == Side::bid ? bids_ : asks_)) return false;
+        }
+        return live == expected_live;
+    }
+};
+
+const char* result_name(AddResult result) {
+    switch (result) {
+    case AddResult::added: return "added";
+    case AddResult::invalid_side: return "invalid_side";
+    case AddResult::invalid_price: return "invalid_price";
+    case AddResult::invalid_quantity: return "invalid_quantity";
+    case AddResult::duplicate_id: return "duplicate_id";
+    case AddResult::quantity_overflow: return "quantity_overflow";
+    }
+    return "invalid AddResult enum";
+}
+const char* result_name(CancelResult result) {
+    return result == CancelResult::cancelled ? "cancelled" : "not_found";
+}
+std::string describe(const std::optional<PriceLevel>& level) {
+    if (!level) return "absent";
+    return "price=" + std::to_string(level->price) + ",qty=" + std::to_string(level->total_quantity);
+}
+
+struct RandomContext {
+    std::uint64_t seed;
+    std::uint64_t index = 0; // One-based primary operation; 0 is initial empty state.
+    std::string operation = "initial empty state";
+    [[noreturn]] void fail(const char* impl, const std::string& check,
+                          const std::string& expected, const std::string& observed) const {
+        std::cerr << "RANDOM MISMATCH seed=" << seed << " op_index=" << index
+                  << " operation={" << operation << "} implementation=" << impl
+                  << " check=" << check << " expected={" << expected << "} observed={"
+                  << observed << "}\n";
+        throw std::runtime_error("random verification failed");
+    }
+    void levels(const char* impl, const char* check, const DepthSnapshot& expected,
+                const DepthSnapshot& observed) const {
+        const auto count = std::min(expected.size(), observed.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            if (expected[i].price != observed[i].price ||
+                expected[i].total_quantity != observed[i].total_quantity)
+                fail(impl, std::string(check) + " level=" + std::to_string(i),
+                     describe(expected[i]), describe(observed[i]));
+        }
+        if (expected.size() != observed.size())
+            fail(impl, check, "size=" + std::to_string(expected.size()),
+                 "size=" + std::to_string(observed.size()));
+    }
+};
+
+int run_random(std::uint64_t ops, std::uint64_t seed) {
+    const auto started = std::chrono::steady_clock::now();
+    OrderBookA a; OrderBookB b; OrderBookC c;
+    ReferenceModel model;
+    std::vector<OrderId> live_ids;
+    OrderId next_id = 0;
+    std::mt19937_64 rng(seed);
+    // Explicit rejection sampling avoids standard-library distribution differences.
+    auto draw = [&](std::uint64_t bound) {
+        const auto threshold = (std::uint64_t{0} - bound) % bound;
+        std::uint64_t value;
+        do { value = rng(); } while (value < threshold);
+        return value % bound;
+    };
+    const std::array<OrderBook*, 3> books{&a, &b, &c};
+    const std::array<const char*, 3> names{"A", "B", "C"};
+    RandomContext context{seed, 0, "initial empty state"};
+    std::uint64_t adds = 0, cancels = 0, bbos = 0, bids = 0, asks = 0, checkpoints = 0;
+    auto compare = [&](bool full) {
+        const auto expected = model.get_bbo();
+        const auto expected_bids = model.depth(Side::bid, full ? all_depth : 10);
+        const auto expected_asks = model.depth(Side::ask, full ? all_depth : 10);
+        for (std::size_t i = 0; i < books.size(); ++i) {
+            try {
+                const auto observed = books[i]->get_bbo();
+                if (describe(expected.bid) != describe(observed.bid))
+                    context.fail(names[i], "BBO bid", describe(expected.bid), describe(observed.bid));
+                if (describe(expected.ask) != describe(observed.ask))
+                    context.fail(names[i], "BBO ask", describe(expected.ask), describe(observed.ask));
+                context.levels(names[i], full ? "full bids" : "bids(10)", expected_bids,
+                               books[i]->get_bids(full ? all_depth : 10));
+                context.levels(names[i], full ? "full asks" : "asks(10)", expected_asks,
+                               books[i]->get_asks(full ? all_depth : 10));
+            } catch (const std::exception& e) {
+                context.fail(names[i], "query/comparison", "successful query", e.what());
+            }
+        }
+    };
+    auto checkpoint = [&] {
+        if (!model.audit(live_ids.size())) context.fail("reference", "audit", "valid", "invalid");
+        if (!OrderBookATestAccess::valid(a)) context.fail("A", "invariants", "valid", "invalid");
+        if (!OrderBookBTestAccess::valid(b)) context.fail("B", "invariants", "valid", "invalid");
+        if (!OrderBookCTestAccess::valid(c)) context.fail("C", "invariants", "valid", "invalid");
+        compare(true); ++checkpoints;
+    };
+    checkpoint();
+    for (std::uint64_t index = 0; index < ops; ++index) {
+        context.index = index + 1;
+        const auto choice = draw(100);
+        // Empty-state cancellation choices become adds, preserving live-only cancellation.
+        if (choice < 70 || (choice < 90 && live_ids.empty())) {
+            const Side side = draw(2) == 0 ? Side::bid : Side::ask;
+            const PriceTicks price = (side == Side::bid ? 5000 : 10001) + static_cast<PriceTicks>(draw(5000));
+            const Quantity qty = static_cast<Quantity>(draw(100) + 1);
+            const Order order{next_id, side, price, qty};
+            context.operation = "add id=" + std::to_string(order.id) + " side=" +
+                (side == Side::bid ? "bid" : "ask") + " ticks=" + std::to_string(price) +
+                " qty=" + std::to_string(qty);
+            const auto expected = model.add_order(order);
+            if (expected != AddResult::added) context.fail("reference", "valid add", "added", result_name(expected));
+            for (std::size_t i = 0; i < books.size(); ++i) {
+                try {
+                    const auto observed = books[i]->add_order(order);
+                    if (observed != expected) context.fail(names[i], "add result", result_name(expected), result_name(observed));
+                } catch (const std::exception& e) {
+                    context.fail(names[i], "add/exception", result_name(expected), e.what());
+                }
+            }
+            live_ids.push_back(next_id++); ++adds;
+            if (side == Side::bid) ++bids; else ++asks;
+        } else if (choice < 90) {
+            const auto pos = static_cast<std::size_t>(draw(live_ids.size()));
+            const auto id = live_ids[pos];
+            context.operation = "cancel id=" + std::to_string(id);
+            const auto expected = model.cancel_order(id);
+            if (expected != CancelResult::cancelled) context.fail("reference", "live cancel", "cancelled", result_name(expected));
+            for (std::size_t i = 0; i < books.size(); ++i) {
+                try {
+                    const auto observed = books[i]->cancel_order(id);
+                    if (observed != expected) context.fail(names[i], "cancel result", result_name(expected), result_name(observed));
+                } catch (const std::exception& e) {
+                    context.fail(names[i], "cancel/exception", result_name(expected), e.what());
+                }
+            }
+            live_ids[pos] = live_ids.back(); live_ids.pop_back(); ++cancels;
+        } else {
+            context.operation = "get_bbo"; ++bbos;
+        }
+        // Always check BBO and top-ten snapshots, including checkpoint operations.
+        compare(false);
+        if (context.index % 1000 == 0) checkpoint();
+        if (context.index % 10000 == 0)
+            std::cout << "Random progress seed=" << seed << " ops=" << context.index << '\n' << std::flush;
+    }
+    if (ops % 1000 != 0) checkpoint();
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::cout << "RANDOM PASS seed=" << seed << " ops=" << ops << " adds=" << adds
+              << " cancels=" << cancels << " bbo=" << bbos << " bid_adds=" << bids
+              << " ask_adds=" << asks << " live=" << live_ids.size()
+              << " full/invariant_checkpoints=" << checkpoints
+              << " verification_seconds=" << seconds << '\n';
+    return 0;
+}
+
+std::uint64_t parse_number(std::string_view value) {
+    std::uint64_t number = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || value.empty())
+        throw std::invalid_argument("expected an unsigned decimal integer: " + std::string(value));
+    return number;
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        bool random = false, configured = false;
+        std::uint64_t ops = 100000, seed = 42;
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view arg = argv[i];
+            if (arg == "--help") {
+                std::cout << "verify [--random [--ops N] [--seed N]]\n"
+                             "Always runs 78 deterministic cases; random defaults: ops=100000 seed=42.\n";
+                return 0;
+            }
+            if (arg == "--random") random = true;
+            else if (arg == "--ops" || arg == "--seed") {
+                if (++i == argc) throw std::invalid_argument("missing value for " + std::string(arg));
+                const auto value = parse_number(argv[i]);
+                if (arg == "--ops") ops = value; else seed = value;
+                configured = true;
+            } else throw std::invalid_argument("unknown option: " + std::string(arg));
+        }
+        if (configured && !random) throw std::invalid_argument("--ops/--seed require --random");
+        if (run_deterministic() != 0) return 1;
+        return random ? run_random(ops, seed) : 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Verification error: " << e.what() << '\n';
+        return 1;
+    }
 }

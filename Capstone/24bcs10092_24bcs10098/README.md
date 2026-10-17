@@ -5,9 +5,9 @@
 | Daksh Shah | 24bcs10092 | shah.24bcs10092@sst.scaler.com |
 | Tirth Bhalani | 24bcs10098 | tirth.24bcs10098@sst.scaler.com |
 
-Stage 4: A/B are approved; C is implemented for review.
+Stage 5: A/B/C are approved; seeded reference-model verification is added for review.
 C++17, Release `-O2`, single instrument and single thread. No matching or trades.
-A/B/C have deterministic functional verification and initial cross-checks. No benchmark exists.
+A/B/C have deterministic and randomized correctness verification. No benchmark exists.
 
 ## Layout
 
@@ -19,7 +19,7 @@ A/B/C have deterministic functional verification and initial cross-checks. No be
 | impl_b/ | Indexed binary-heap OrderBookB (.hpp and .cpp) |
 | impl_c/ | Fixed tick-array/occupancy-bitmap OrderBookC (.hpp and .cpp) |
 | main.cpp | Comment-only placeholder for a later demo; not built |
-| verify.cpp | 78 cases: 20 contracts each for A/B/C, 7 B-specific, 9 C-specific, 2 cross-checks |
+| verify.cpp | Original 78 deterministic cases plus seeded independent-reference random verification |
 | bench.cpp | Comment-only placeholder for a later benchmark; not built |
 | implementations.md | Proposed API contract, invariants, designs, complexity and review questions |
 | benchmark.md | Placeholder and future measurement requirements; no results |
@@ -85,3 +85,73 @@ C uses 5,000 fixed levels and 79 bitmap words per side. Its last word has eight
 valid bits; queries mask unused bits. Cached totals and FIFO-node locators avoid
 order scans for depth/cancellation. Its list/index allocations finish before
 committing totals and occupancy; allocation-failure injection remains future work.
+
+## Seeded randomized correctness verification
+
+Run from the project directory in Ubuntu WSL after the Release build:
+
+```sh
+./build/verify
+./build/verify --random --ops 100000 --seed 42
+./build/verify --random --ops 100000 --seed 7
+./build/verify --random --ops 100000 --seed 2026
+```
+
+Every invocation runs the existing 78 deterministic cases first. `--random`
+defaults to 100000 operations and seed 42; `--help` shows usage. Numeric options
+are unsigned decimal integers. `--ops` and `--seed` require `--random`.
+
+The generator uses mt19937_64 and explicit rejection sampling: approximately
+70% adds, 20% cancellations from live IDs only, and 10% BBO operations. An empty
+cancellation choice becomes an add. Add side is sampled 50/50, quantities are
+1..100 and tick prices are uniform across each side's 5000 valid ticks. IDs are
+monotonic and never reused. The printed exact counts need not equal the nominal
+percentages. Additional BBO/depth comparisons are verification work outside
+those primary operation counts.
+
+The independent model uses append-only order records and sorted aggregate
+vectors, with no production map, heap, bitmap or locator code. Every operation
+compares results, BBO and both top-ten snapshots. Full-depth comparisons and
+internal invariant checks run initially, every 1000 operations and at the final
+partial checkpoint. The model also rebuilds aggregates from live records then.
+
+Failures report seed, one-based operation index (0 for initial state), operation
+details, implementation, check, expected and observed values; exit is nonzero.
+Progress is printed every 10000 operations. Runtime is correctness-verification
+wall time, not order-book benchmark latency or throughput. Logs under build/
+are ignored. No benchmark or perf measurements are performed.
+
+Sanitizer commands, also from the project directory:
+
+```sh
+g++ -std=c++17 -O2 -g -fsanitize=address,undefined \
+  -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -I . \
+  impl_a/orderbook_a.cpp impl_b/orderbook_b.cpp impl_c/orderbook_c.cpp \
+  verify.cpp -o build/verify_sanitized
+./build/verify_sanitized --random --ops 100000 --seed 42
+```
+
+### Observed Stage 5 Release results
+
+All original 78 deterministic cases passed. The following reference-model runs
+also passed with zero mismatches; each completed 101 full-depth/invariant checks.
+
+| Seed | Primary ops | Adds | Live-ID cancels | BBO ops | Bid adds | Ask adds | Final live | Verification seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 100000 | 70017 | 19906 | 10077 | 35098 | 34919 | 50111 | 126.965 |
+| 7 | 100000 | 69882 | 20155 | 9963 | 34910 | 34972 | 49727 | 152.467 |
+| 2026 | 100000 | 69966 | 20164 | 9870 | 35047 | 34919 | 49802 | 153.103 |
+
+Durations include verification overhead and concurrent test-run load. They are
+not benchmark measurements and should not be used to compare implementations.
+Five malformed CLI cases were rejected: negative count, uint64 overflow, seed
+without --random, missing count, and unknown flag. A zero-operation run passed
+with default seed 42 and one initial full/invariant checkpoint.
+
+Repeatability check: two seed-42 runs of 1234 operations produced identical output
+excluding elapsed time (842 adds, 277 cancels, 115 BBO operations, three checkpoints).
+ASan/UBSan also passed all 78 deterministic cases and 100000 random operations
+with seed 42, exit 0, with no sanitizer diagnostics. Counts matched Release:
+70017 adds, 19906 cancels, 10077 BBO operations and 101 full/invariant checkpoints.
+Observed sanitizer verification wall time: 309.457 seconds; this is checking
+runtime, not a benchmark. Logs are retained only in ignored build artifacts.

@@ -1,7 +1,8 @@
-# Implementation architecture — Stage 4
+# Implementation architecture — Stage 5
 
-A, B and C are implemented independently. Initial deterministic A/B and A/B/C
-cross-checks exist; no benchmark or profiling exists. A/B source is unchanged in Stage 4.
+A, B and C are implemented independently. Deterministic cross-checks and a seeded
+independent reference-model verifier exist; no benchmark or profiling exists.
+All three approved implementation sources remain unchanged in Stage 5.
 
 ## Scope and common API
 
@@ -281,7 +282,7 @@ depth snapshots at -1, 0, 1, 3 and INT64_MAX after each operation, while checkin
 all three internal invariant sets. It includes invalid requests, overflow/retry,
 ID reuse rejection, word-spanning prices, UINT64_MAX, repeated cancellation and
 complete draining. It is deterministic correctness verification, not a benchmark
-or a substitute for a future independent reference model.
+or a substitute for the separate independent reference model added in Stage 5 below.
 ## Expected complexity and limitations
 
 N = live orders; U = lifetime accepted IDs; L = occupied levels on the relevant
@@ -311,8 +312,8 @@ are inferred from these bounds.
 ## Later authorized work and remaining decisions
 
 Broader differential verification, demo and benchmark are
-not part of Stage 4. Future verification should add an independent reference
-model, generated traces and allocation-failure injection.
+not part of Stage 5. Allocation-failure injection remains future work; the initial
+independent reference model and generated valid traces are now implemented.
 
 The benchmark must use exactly 1,000,000 primary operations: 700,000 adds,
 200,000 cancellations of live orders and 100,000 BBO calls. Both depth queries
@@ -330,3 +331,56 @@ an allocation-free book. No performance advantage is claimed without measurement
 Reviewer questions: approve C's implementation, any timestamp requirement,
 B's sequence-exhaustion policy, allocation-failure test scope, and final
 benchmark parameters. No benchmark results or screenshots exist at this stage.
+
+## Stage 5 independent randomized verifier
+
+verify.cpp retains all 78 deterministic cases and adds --random, --ops and --seed.
+The defaults are 100000 primary operations and seed 42. Each random invocation
+first runs the deterministic suite, including business-input rejection, empty
+books, boundary prices, overflow, duplicates, cancelled-ID reuse and unknown
+cancellation cases with explicit independent expected values.
+
+The random oracle is an append-only vector of {Order, active} records, indexed
+by dense monotonic trace ID. Cancel marks a record inactive without deleting its
+accepted-ID history. Each side's aggregate levels are kept in an ascending sorted
+vector using lower_bound plus insertion/erasure; this is deliberately different
+from A's maps, B's heaps/hash aggregates and C's bitmap/arrays. The oracle uses
+none of their internal accessors, locators or ordering algorithms. Internal
+accessors are used only for periodic production invariant checks.
+
+The oracle is scoped to sequential IDs from this generated workload; sparse and
+UINT64_MAX IDs remain covered by the deterministic contract tests. It is not a
+new production implementation. Its allocation failures abort the verification
+run; recovery from oracle allocation failure is not promised.
+
+mt19937_64 plus explicit rejection sampling maps draws uniformly to bounded
+integers without depending on uniform_int_distribution library behavior. Choices
+0..69 add, 70..89 cancel and 90..99 query BBO. When a cancellation is selected with
+no live IDs, it becomes an add. An independent live-ID vector supports uniformly
+selecting a live cancellation and swap/pop removal; only accepted IDs enter it.
+Adds sample bid/ask with equal probability, prices across 5000 ticks uniformly,
+and quantities 1..100. Actual operation/side counts are printed, not assumed.
+
+After every operation the verifier compares enum results as applicable, BBO
+presence/price/aggregate, and both depth(10) snapshots against the model. It also
+checks initial empty state, full snapshots and all production invariants every
+1000 operations and at a final nonmultiple checkpoint. At those checkpoints the
+model independently reconstructs totals by sorting its active order records and
+summing equal prices, checking its incremental aggregate vectors and live count.
+
+This avoids scanning all live orders for every operation; invariant/oracle scans
+are periodic. The verifier still sorts B's occupied levels for each depth query,
+so it is intentionally more expensive than a benchmark. Runtime includes oracle,
+comparisons and invariant work. It does not report performance claims.
+
+Mismatch diagnostics include seed, operation index, details, implementation and
+expected/observed result or first differing level/size. Unexpected production
+exceptions also identify the responsible implementation. Main returns nonzero
+on verification or CLI errors. Numeric parsing rejects malformed, negative or
+out-of-range uint64 values; no production CLI or benchmark is introduced.
+
+Finite seeds do not prove correctness. Random operations are valid and use small
+quantities; the deterministic cases provide invalid-input and overflow coverage.
+Allocation fault injection, large-scale sparse-ID random traces, and exhaustive
+state exploration remain outside this stage. See README for executed commands
+and observed results.
