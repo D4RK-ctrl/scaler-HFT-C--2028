@@ -1,4 +1,4 @@
-# Preliminary deterministic benchmark — Stage 6
+# Order book benchmark
 
 Team: Daksh Shah (24bcs10092) and Tirth Bhalani (24bcs10098).
 Recorded on 17 October 2026. These are preliminary instrumented WSL results;
@@ -87,7 +87,7 @@ BBO, every required depth result, and final BBO/full depth. It is printed and
 compared so queries remain observable. Post-replay final snapshots and their
 checksum work are outside timing. These extra validation queries do not count
 as timed workload calls. Hash agreement is not proof against collisions; the
-approved Stage 5 independent-model verification supplies additional correctness
+approved randomized verification independent-model verification supplies additional correctness
 evidence. This benchmark does not rerun the full random oracle inside timing.
 
 ## Measurement limitations and fairness
@@ -277,8 +277,8 @@ g++ -std=c++17 -O2 -g -fsanitize=address,undefined \
 ./build/verify --random --ops 1234 --seed 42
 ```
 
-The unchanged Stage 5 verifier again passed all 78 deterministic cases plus
+The verifier again passed all 78 deterministic cases plus
 1234 reference-model operations: 842 adds, 277 cancels, 115 BBO, three full-depth/
 invariant checkpoints. No approved algorithm, shared API or verifier source
-was changed, and no failures or compiler warnings were observed. Stage 5's
+was changed, and no failures or compiler warnings were observed. randomized verification's
 full 100000-operation random runs were not repeated for this harness-only change.
