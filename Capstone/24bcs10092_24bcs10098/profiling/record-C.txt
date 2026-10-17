@@ -1,2 +1,0 @@
-[ perf record: Woken up 1 times to write data ]
-[ perf record: Captured and wrote 0.053 MB build-profile/evidence/perf-C.data (503 samples) ]
