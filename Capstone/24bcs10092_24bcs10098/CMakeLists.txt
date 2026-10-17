@@ -27,6 +27,10 @@ add_library(orderbook_c STATIC impl_c/orderbook_c.cpp)
 target_link_libraries(orderbook_c PUBLIC orderbook)
 target_compile_options(orderbook_c PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(bench bench.cpp)
+target_link_libraries(bench PRIVATE orderbook_a orderbook_b orderbook_c)
+target_compile_options(bench PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(verify verify.cpp)

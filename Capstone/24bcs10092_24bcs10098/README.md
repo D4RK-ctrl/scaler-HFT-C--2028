@@ -5,9 +5,9 @@
 | Daksh Shah | 24bcs10092 | shah.24bcs10092@sst.scaler.com |
 | Tirth Bhalani | 24bcs10098 | tirth.24bcs10098@sst.scaler.com |
 
-Stage 5: A/B/C are approved; seeded reference-model verification is added for review.
+Stage 6: approved A/B/C and verification are preserved; the deterministic benchmark is added for review.
 C++17, Release `-O2`, single instrument and single thread. No matching or trades.
-A/B/C have deterministic and randomized correctness verification. No benchmark exists.
+A/B/C have deterministic/random correctness verification and preliminary benchmark results.
 
 ## Layout
 
@@ -20,14 +20,14 @@ A/B/C have deterministic and randomized correctness verification. No benchmark e
 | impl_c/ | Fixed tick-array/occupancy-bitmap OrderBookC (.hpp and .cpp) |
 | main.cpp | Comment-only placeholder for a later demo; not built |
 | verify.cpp | Original 78 deterministic cases plus seeded independent-reference random verification |
-| bench.cpp | Comment-only placeholder for a later benchmark; not built |
+| bench.cpp | Exact-count deterministic trace, untimed A/B/C checks and instrumented replay |
 | implementations.md | Proposed API contract, invariants, designs, complexity and review questions |
-| benchmark.md | Placeholder and future measurement requirements; no results |
+| benchmark.md | Measurement method, full preliminary 1M/five-run output, medians and limitations |
 | screenshots/ | Only .gitkeep; no screenshots yet |
 
 Shared headers and entry points are at the project root to keep navigation simple.
-CMake builds orderbook_a, orderbook_b and orderbook_c static libraries and verify.
-Demo/benchmark placeholders are not built.
+CMake builds orderbook_a, orderbook_b and orderbook_c static libraries, verify and bench.
+The demo placeholder main.cpp is not built.
 
 ## Build and verify A/B/C in Ubuntu WSL
 
@@ -73,9 +73,9 @@ The shared types and interface do not select a default implementation yet.
 inspected at head `20cbbca2fe0694c63482f5794f3cf2912fd95b2a`: changed paths,
 README and CMake only. Its root shared headers/entry points, implementation
 subdirectories and report locations informed this layout. Its CMake has separate
-implementation libraries and demo/verify/bench executables; A/B/C libraries and their shared verification target exist here. We retain C++17 and our map/indexed-heap/tick-array designs.
+implementation libraries and demo/verify/bench executables; A/B/C libraries, verify and bench targets exist here. We retain C++17 and our map/indexed-heap/tick-array designs.
 No source implementation, reports, measurements or screenshots were copied.
-The future workload remains 1,000,000 primary operations; see benchmark.md.
+The mandatory benchmark uses 1,000,000 primary operations; see benchmark.md.
 
 B completes allocations before heap movements and rolls back provisional entries on
 failure. Allocation-failure injection remains future work. Arrival-sequence exhaustion
@@ -155,3 +155,42 @@ with seed 42, exit 0, with no sanitizer diagnostics. Counts matched Release:
 70017 adds, 19906 cancels, 10077 BBO operations and 101 full/invariant checkpoints.
 Observed sanitizer verification wall time: 309.457 seconds; this is checking
 runtime, not a benchmark. Logs are retained only in ignored build artifacts.
+## Deterministic benchmark (Stage 6)
+
+From the project directory in Ubuntu WSL, after the Release build:
+
+```sh
+./build/bench --help
+./build/bench --impl A --ops 1000 --runs 2 --seed 42
+./build/bench --impl A --ops 1000000 --runs 5 --seed 42
+./build/bench --impl B --ops 1000000 --runs 5 --seed 42
+./build/bench --impl C --ops 1000000 --runs 5 --seed 42
+```
+
+Run mandatory commands sequentially. Each generates one deterministic trace,
+audits it and validates A/B/C outcomes outside timing, then runs the selected
+implementation with five fresh empty books. The 1M trace contains exactly 700000
+adds, 200000 live-ID cancels and 100000 BBO calls, plus both depth(10) calls every
+100 operations (10000 calls per side). The same seed produces the same trace
+fingerprint across commands. IDs are never reused and prices are integer ticks.
+
+Custom --ops N uses floor(7*N/10) adds, floor(2*N/10) cancels and the remaining
+operations as BBO; both depth calls occur floor(N/100) times. Supported bounds:
+ops=10..2000000, runs=1..25, seed=0..UINT64_MAX. --impl A/B/C is required.
+Defaults are ops=1000000, runs=5, seed=42. Invalid CLI values fail with usage.
+
+Overall replay time includes all required depth calls, timer overhead and checksum
+bookkeeping. Per-operation means use timed sections and actual counts; reported
+medians are medians of per-run means, not isolated latencies. Construction,
+destruction, trace generation, validation and printing are outside replay timing.
+Real Linux page-fault deltas and process high-water RSS are reported; RSS includes
+trace and untimed A/B/C passes, so it does not isolate selected-book memory.
+
+Observed mandatory medians (Release -O2, seed 42): A 429.377 ms, B 6737.518 ms,
+C 327.892 ms. Every timed and validation replay agreed on checksum
+12750139682901687748 and final BBO bid 9999:2988, ask 10001:2344 (ticks:quantity).
+B's median depth total was 6063.265 ms: the required sorting cost is fully retained.
+These are preliminary WSL measurements with per-call instrumentation and warm
+allocator/cache effects. See [benchmark.md](benchmark.md) for all five runs,
+per-operation/depth medians, environment, raw output and fairness limitations.
+No perf profiling or screenshots have been collected in Stage 6.

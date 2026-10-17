@@ -1,8 +1,9 @@
-# Implementation architecture — Stage 5
+# Implementation architecture — Stage 6
 
 A, B and C are implemented independently. Deterministic cross-checks and a seeded
-independent reference-model verifier exist; no benchmark or profiling exists.
-All three approved implementation sources remain unchanged in Stage 5.
+independent reference-model verifier exist. Stage 6 adds the deterministic benchmark;
+see benchmark.md for boundaries, preliminary measurements and limitations. No profiling
+exists yet. All three approved implementation sources remain unchanged in Stage 6.
 
 ## Scope and common API
 
