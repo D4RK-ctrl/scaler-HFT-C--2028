@@ -47,7 +47,7 @@ void usage(std::ostream& out) {
            "Both depth(10) calls occur after every 100 primary operations.\n"
            "Standard mode validates A/B/C untimed before selected implementation runs.\n"
            "Profile-only: selected implementation only; requires ops=1000000 seed=42 runs=1\n"
-           "(runs defaults to 1 in this mode); checks the approved Stage 6 fixture.\n";
+           "(runs defaults to 1 in this mode); checks the fixed benchmark fixture.\n";
 }
 std::uint64_t number(std::string_view text) {
     std::uint64_t value = 0;
@@ -84,7 +84,7 @@ Config parse(int argc, char** argv) {
     if (config.profile_only) {
         if (seen.count("--runs") == 0) config.runs = 1;
         if (config.ops != 1000000 || config.seed != 42 || config.runs != 1)
-            throw std::invalid_argument("profile-only supports only the approved ops=1000000 seed=42 runs=1 fixture");
+            throw std::invalid_argument("profile-only supports only the required ops=1000000 seed=42 runs=1 fixture");
     }
     return config;
 }
@@ -309,16 +309,16 @@ int main(int argc, char** argv) {
         const auto count = counts(config.ops);
         const auto fingerprint = validate_trace(trace, count);
         if (config.profile_only) {
-            // This is a specific approved Stage 6 fixture, never an oracle for arbitrary input.
+            // This is a specific fixed benchmark fixture, never an oracle for arbitrary input.
             if (fingerprint != 1002121172284863879ULL)
-                throw std::runtime_error("profile trace differs from approved Stage 6 fixture");
+                throw std::runtime_error("profile trace differs from fixed benchmark fixture");
             std::cout << "PROFILE_ONLY selected implementation; whole-process perf includes setup, replay, final checks and destruction.\n";
             auto book = make_book(config.impl);
             const auto result = replay(*book, trace, true);
             if (result.checksum != 12750139682901687748ULL ||
                 !same_quote(result.final_bbo.bid, PriceLevel{9999, 2988}) ||
                 !same_quote(result.final_bbo.ask, PriceLevel{10001, 2344}))
-                throw std::runtime_error("profile result differs from approved Stage 6 fixture");
+                throw std::runtime_error("profile result differs from fixed benchmark fixture");
             report("profile_run=1", result, count);
             std::cout << "PROFILE_FIXTURE_VALIDATION=PASS\n";
             return 0;
