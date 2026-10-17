@@ -64,9 +64,9 @@ counter is needed. Orders are never sorted by ID. A has no sequence-exhaustion
 condition. The current public contract has no caller timestamp; FIFO follows successful
 call order.
 
-## Actual A storage and five operations
+## A: Ordered maps and FIFO lists
 
-`impl_a/orderbook_a.hpp` declares the final `OrderBookA` class. Its source owns:
+`impl_a/orderbook_a.hpp` declares `OrderBookA`. Its source owns:
 
 - Two ascending `std::map<PriceTicks, Level>` containers, one per side.
 - Each occupied level holds a cached total and a `std::list<Order>` in FIFO order.
@@ -113,10 +113,10 @@ add/cancel. A friend test-access struct is defined only in verification code; it
 does not add operations to the public API. Tests use runtime checks rather than
 assert, so Release `-DNDEBUG` does not disable them. They cover both sides, empty
 books, endpoints, invalid inputs, all cancellation positions, history, overflow,
-owned snapshots and dispatch through the abstract interface. The original 20 A cases are preserved as a shared templated suite and also run
+owned snapshots and dispatch through the abstract interface. The 20 A cases form a shared templated suite and also run
 against B and C. These are not random differential tests.
 
-## B. Indexed binary heaps — implemented
+## B: Indexed binary heaps
 
 `impl_b/orderbook_b.hpp` and `.cpp` define `OrderBookB`, independently of A.
 Each side stores individual orders in a contiguous `vector<Entry>`. An entry
@@ -198,9 +198,8 @@ unchanged snapshots/history. All runtime checks remain enabled under NDEBUG.
 The A/B cross-check compares add/cancel results, BBO presence/prices/quantities
 and both depth snapshots at depths -1, 0, 1, 3 and INT64_MAX after every operation.
 It covers invalid input, overflow/retry, cancelled-ID rejection, repeated prices,
-unknown/repeated cancellation and complete draining. This is initial verification,
-not an independent reference model or a benchmark; shared bugs remain possible.
-## C. Tick arrays and occupancy bitmap — implemented
+unknown/repeated cancellation and complete draining. The separate reference-model tests provide additional verification.
+## C: Tick arrays and occupancy bitmap
 
 `impl_c/orderbook_c.hpp` and `.cpp` define `OrderBookC`, independently of A/B.
 Each side has a `std::array<Level, 5000>`. Every level owns a cached signed 64-bit
@@ -320,8 +319,7 @@ policy is explicit above; A/C use list insertion order without a sequence counte
 
 Allocation-failure injection, exhaustive state exploration, independent sparse-ID
 random traces, production tail latency and controlled native Linux measurements
-are not covered. There are no pending alternate API decisions in this submission.
-Screenshot collection is separately blocked as documented in screenshots/README.md.
+are not covered.
 ## Independent randomized verifier
 
 verify.cpp retains all 78 deterministic cases and adds --random, --ops and --seed.
