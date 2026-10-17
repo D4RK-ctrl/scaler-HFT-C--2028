@@ -87,7 +87,7 @@ BBO, every required depth result, and final BBO/full depth. It is printed and
 compared so queries remain observable. Post-replay final snapshots and their
 checksum work are outside timing. These extra validation queries do not count
 as timed workload calls. Hash agreement is not proof against collisions; the
-approved randomized verification independent-model verification supplies additional correctness
+Independent reference-model verification supplies additional correctness
 evidence. This benchmark does not rerun the full random oracle inside timing.
 
 ## Measurement limitations and fairness
@@ -108,7 +108,7 @@ influence these preliminary medians. Fixed A/B/C command order can also bias the
 B copies and sorts occupied aggregate levels on every depth call. All 20,000
 required depth calls remain enabled; their separate timings expose that cost.
 Depth cost and mutation cost should not be conflated when interpreting overall
-runtime. The approved data structures were not modified for measurements.
+runtime. The data structures were not modified during benchmarking.
 
 Linux getrusage(RUSAGE_SELF) supplies real counters. process_peak_rss_kib is the
 process-lifetime RSS high-water mark in KiB; it includes trace generation, trace
@@ -152,7 +152,7 @@ zero/excessive ops, zero/excessive runs, negative/overflow seed, missing value,
 missing implementation, duplicate option and unknown option.
 
 The preserved deterministic verifier passed 78/78 cases via CTest (one test
-executable), with no source changes to verify.cpp or approved A/B/C algorithms.
+executable), with no changes to the verifier or A/B/C implementations.
 ## Mandatory one-million-operation results
 
 All three commands completed five timed replays and untimed A/B/C validation.
@@ -279,6 +279,6 @@ g++ -std=c++17 -O2 -g -fsanitize=address,undefined \
 
 The verifier again passed all 78 deterministic cases plus
 1234 reference-model operations: 842 adds, 277 cancels, 115 BBO, three full-depth/
-invariant checkpoints. No approved algorithm, shared API or verifier source
-was changed, and no failures or compiler warnings were observed. randomized verification's
-full 100000-operation random runs were not repeated for this harness-only change.
+invariant checkpoints. No implementation, shared API or verifier code was changed during benchmarking.
+No failures or compiler warnings were observed. The previous 100,000-operation
+randomized verification runs were not repeated for these benchmark checks.
