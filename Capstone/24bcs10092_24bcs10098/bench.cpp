@@ -309,7 +309,7 @@ int main(int argc, char** argv) {
         const auto count = counts(config.ops);
         const auto fingerprint = validate_trace(trace, count);
         if (config.profile_only) {
-            // This is a specific fixed benchmark fixture, never an oracle for arbitrary input.
+            // Use only the fixed seed-42 workload; other traces require full cross-validation.
             if (fingerprint != 1002121172284863879ULL)
                 throw std::runtime_error("profile trace differs from fixed benchmark fixture");
             std::cout << "PROFILE_ONLY selected implementation; whole-process perf includes setup, replay, final checks and destruction.\n";
