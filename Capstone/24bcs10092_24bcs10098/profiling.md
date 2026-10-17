@@ -233,8 +233,7 @@ still clearly reaches its depth sorting; no A/C depth sorting was introduced.
 
 Local text excerpts are in profiling/report-{A,B,C}-{self,stacks}.txt. They trim
 line ends and abbreviate very long symbol names at 240 characters, labelled in
-the files; full original reports remain in build-profile/evidence. Actual record
-summaries are in profiling/record-{A,B,C}.txt, not invented sample counts. Small
+the files; full original reports remain in build-profile/evidence. The sample counts above come from the original perf record logs retained locally under the ignored build-profile/evidence directory. Small
 A/C sample counts and unresolved system frames limit fine-grained conclusions.
 
 ## Outcome and scope audit
